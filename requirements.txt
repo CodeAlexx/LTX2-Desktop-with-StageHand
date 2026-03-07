@@ -1,0 +1,7 @@
+dearpygui>=1.11
+torch>=2.1
+safetensors
+Pillow
+av
+sounddevice
+numpy
