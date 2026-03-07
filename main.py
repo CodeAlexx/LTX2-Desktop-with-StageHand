@@ -14,7 +14,11 @@ import sys
 from pathlib import Path
 
 # Add ltx packages to path
-_ltx_packages = Path("/home/alex/LTX-2/packages")
+_ltx_packages = Path(__file__).parent / "LTX-2" / "packages"
+# Or set LTX_PACKAGES env var to your LTX-2/packages directory
+import os
+if os.environ.get("LTX_PACKAGES"):
+    _ltx_packages = Path(os.environ["LTX_PACKAGES"])
 for pkg in ("ltx-core/src", "ltx-pipelines/src"):
     p = str(_ltx_packages / pkg)
     if p not in sys.path:

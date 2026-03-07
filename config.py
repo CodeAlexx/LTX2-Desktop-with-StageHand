@@ -10,12 +10,12 @@ from pathlib import Path
 class AppConfig:
     """Central configuration for the LTX-2 desktop app."""
 
-    # --- Model paths ---
-    distilled_checkpoint_path: str = "/home/alex/EriDiffusion/Models/ltx2/ltx-2.3-22b-distilled.safetensors"
-    dev_checkpoint_path: str = "/home/alex/EriDiffusion/Models/ltx2/ltx-2.3-22b-dev-fp8.safetensors"
-    gemma_root: str = "/home/alex/models/gemma-3-12b-it"
-    distilled_lora_path: str = "/home/alex/EriDiffusion/Models/ltx2/ltx-2.3-22b-distilled-lora-384.safetensors"
-    spatial_upsampler_path: str = "/home/alex/EriDiffusion/Models/ltx2/ltx-2.3-spatial-upscaler-x2-1.0.safetensors"
+    # --- Model paths (update these to your local model locations) ---
+    distilled_checkpoint_path: str = "./models/ltx-2.3-22b-distilled.safetensors"
+    dev_checkpoint_path: str = "./models/ltx-2.3-22b-dev-fp8.safetensors"
+    gemma_root: str = "./models/gemma-3-12b-it"
+    distilled_lora_path: str = "./models/ltx-2.3-22b-distilled-lora-384.safetensors"
+    spatial_upsampler_path: str = "./models/ltx-2.3-spatial-upscaler-x2-1.0.safetensors"
 
     # Output
     output_dir: str = "./output"

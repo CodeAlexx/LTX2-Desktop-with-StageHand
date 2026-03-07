@@ -704,6 +704,12 @@ class LTX2Pipeline:
             video_chunks_number=video_chunks_number,
         )
 
+        # Final GPU cleanup — free everything so the desktop app doesn't hold VRAM
+        del decoded_video, decoded_audio, video_state, audio_state
+        del generator, noiser, stepper, pipeline_components
+        del ledger_s2, ledger
+        _flush()
+
         _log_vram(f"TOTAL: {time.perf_counter() - t_total:.1f}s")
         report("Done!", 1.0)
         return out_path

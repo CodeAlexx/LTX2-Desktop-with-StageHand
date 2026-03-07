@@ -42,7 +42,11 @@ Standalone desktop application for LTX-2.3 22B video generation on a **single 24
 pip install -r requirements.txt
 ```
 
-Ensure `ltx-core/src` and `ltx-pipelines/src` are on your Python path. Edit the paths in `main.py` or set `PYTHONPATH`.
+Ensure `ltx-core/src` and `ltx-pipelines/src` are on your Python path. Either place the `LTX-2/packages` directory inside the app folder, or set `LTX_PACKAGES` to its location:
+
+```bash
+export LTX_PACKAGES=/path/to/LTX-2/packages
+```
 
 ## Usage
 
@@ -94,6 +98,10 @@ The 22B transformer has 48 blocks at ~800MB each in bf16 — far too large for 2
 4. Peak VRAM = non-block params + 1 active block + activations (~21GB)
 
 The same approach handles the Gemma 3 12B text encoder (48 layers, ~128MB each).
+
+## Sample Output
+
+See [sample_output.mp4](sample_output.mp4) — 3s clip generated with distilled mode at 768x512 on an RTX 3090 Ti.
 
 ## License
 
