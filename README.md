@@ -13,9 +13,14 @@ Standalone desktop application for LTX-2.3 22B video generation on a **single 24
 ## Features
 
 - **Two-stage distilled pipeline** — 8+3 denoising steps with spatial upscaler
+- **Four-pass pipeline** — Full-res base → spatial upscale → temporal upscale → refinement
 - **Dev mode** — Full CFG/STG guidance with configurable steps, negative prompts, and distilled LoRA for stage 2
+- **NAG (Normalized Attention Guidance)** — Dual-pass attention guidance for improved coherence without CFG overhead. Configurable scale, alpha, tau.
 - **Text-to-Video & Image-to-Video** — First-frame conditioning with adjustable strength
 - **Audio generation** — Ambient audio generated alongside video, decoded via vocoder
+- **Long video** — Temporal tiling with overlap blending and AdaIN normalization for multi-minute output. Presets for quality/speed tradeoff.
+- **Spatial tiling** — Tile-based stage 2 denoising for higher resolutions with linear blend ramps
+- **FFN chunking** — Chunk feed-forward activations to reduce peak VRAM by 50-75% on long sequences
 - **Prompt enhancement** — Optional Gemma 3 12B prompt rewriting (slow with StageHand)
 - **LoRA support** — Load custom LoRAs with per-adapter strength control
 - **DearPyGui interface** — Inline video player with audio, progress tracking, file browser
@@ -62,6 +67,7 @@ Configure model paths in the **Settings** tab, then use the **Generate** tab to 
 |------|---------|---------|-------|---------|
 | **Distilled** | Half-res, simple denoise | Full-res, simple denoise | 8+3 | Good, fast |
 | **Dev** | Half-res, CFG/STG guidance | Full-res, distilled LoRA | N+3 | Higher, slower |
+| **Four-pass** | Full-res denoise | Spatial 2x → Temporal 2x → Refine | 8+8 | Highest, slowest |
 
 ### Performance (RTX 3090 Ti, 768x512, distilled mode)
 
@@ -78,14 +84,19 @@ Peak VRAM usage: ~21GB during denoising.
 ```
 main.py              Entry point, sys.path setup
 app.py               DearPyGui lifecycle
-config.py            AppConfig dataclass
-pipeline.py          Two-stage pipeline with StageHand
+config.py            AppConfig dataclass (60+ fields)
+pipeline.py          Two-stage / four-pass pipeline with StageHand
 inference_worker.py  Background thread for generation
+nag.py               Normalized Attention Guidance patch
+chunk_ffn.py         Chunked FFN for VRAM reduction
+spatial_tiling.py    Spatial tiling for high-res denoising
+long_video.py        Temporal tiling service for long video
+long_video_presets.py  Preset configs and frame arithmetic
 ui/
-  generate_tab.py    T2V/I2V controls, dev mode params
+  generate_tab.py    T2V/I2V/long video controls, dev mode params
   video_player.py    Inline player with audio (PyAV + sounddevice)
-  settings_tab.py    Model paths configuration
-  lora_tab.py        LoRA management
+  settings_tab.py    Model paths, NAG, FFN, spatial tiling config
+  lora_tab.py        LoRA management with per-adapter strength
 ```
 
 ## How StageHand Works
