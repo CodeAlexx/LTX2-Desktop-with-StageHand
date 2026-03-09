@@ -410,8 +410,8 @@ class LTXVLongVideoService:
             total_frames, temporal_tile_size, temporal_overlap,
         )
 
-        # Half-res for generation (matches regular pipeline stage 1)
-        gen_w, gen_h = width // 2, height // 2
+        # Generate at full resolution — each chunk fits in 24GB with Stagehand
+        gen_w, gen_h = width, height
 
         logger.info(
             "Long video: %d frames (%d chunks), tile=%d, overlap=%d, "
