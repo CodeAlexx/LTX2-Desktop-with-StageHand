@@ -430,8 +430,9 @@ class LTX2Pipeline:
                 )
             all_raw_hs.append(tuple(h.cpu() for h in outputs.hidden_states))
             all_raw_masks.append(attention_mask.cpu())
-            del outputs
+            del outputs, input_ids, attention_mask
             te_runtime.end_step()
+            torch.cuda.empty_cache()  # free activation memory before next encoding
 
         _log_vram("encode_done")
 

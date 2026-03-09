@@ -252,6 +252,7 @@ def extend_chunk(
     )
 
     new_chunk = {"samples": video_state.latent}
+    new_audio = audio_state.latent if audio_state.latent is not None else None
     del video_state, audio_state
 
     # Drop first frame (8-frame boundary artifact)
@@ -264,7 +265,8 @@ def extend_chunk(
 
     # Overlap shifted by 1 after first-frame drop
     effective_overlap = max(latent_overlap - 1, 0)
-    return blend_latent_overlap(prev_latent, new_chunk, effective_overlap)
+    blended = blend_latent_overlap(prev_latent, new_chunk, effective_overlap)
+    return blended, new_audio
 
 
 # -- Keyframe distribution --
@@ -370,6 +372,7 @@ class LTXVLongVideoService:
         adain_factor: 0.3 (light normalization)
     """
 
+    @torch.inference_mode()
     def generate(
         self,
         pipeline: LTX2Pipeline,
@@ -388,7 +391,7 @@ class LTXVLongVideoService:
         per_step_adain_factors: str = "0.9,0.75,0.5,0.25,0.0,0.0,0.0,0.0",
         per_chunk_prompts: list[str] | None = None,
         progress_callback: Callable[[int, int, int, int, float], None] | None = None,
-    ) -> dict:
+    ) -> tuple[dict, torch.Tensor | None]:
         """Generate a long video via temporal tiling.
 
         All chunks are generated at half resolution (width//2, height//2) to fit
@@ -428,11 +431,16 @@ class LTXVLongVideoService:
             psa_factors = [float(x.strip()) for x in per_step_adain_factors.split(",") if x.strip()]
 
         # Build ledger and encode text once (or per-chunk if per_chunk_prompts provided)
+        # NOTE: pipeline.generate() has @torch.inference_mode() but long video
+        # is called separately — must enable it here to avoid autograd OOM.
         ledger = pipeline._build_ledger()
+        cfg = pipeline.config
+        nag_enabled = getattr(cfg, "nag_enabled", False)
 
-        v_ctx, a_ctx, _, _ = pipeline._encode_text_stagehand(
+        v_ctx, a_ctx, _, _, nag_v_ctx, nag_a_ctx = pipeline._encode_text_stagehand(
             ledger, prompt, None, False,
             lambda msg, frac: None,
+            encode_nag=nag_enabled,
         )
 
         # Pre-encode per-chunk prompts if provided
@@ -447,6 +455,14 @@ class LTXVLongVideoService:
 
         # Load transformer (stays resident across all chunks)
         transformer, xfm_inner, xfm_runtime = pipeline._setup_stagehand_transformer(ledger)
+
+        # Apply NAG if enabled in pipeline config
+        nag_patch = None
+        if nag_enabled and nag_v_ctx is not None:
+            from nag import NAGPatch
+            nag_patch = NAGPatch(nag_v_ctx, nag_a_ctx, cfg.nag_scale, cfg.nag_alpha, cfg.nag_tau)
+            nag_patch.apply(transformer)
+            logger.info("NAG applied for long video (scale=%.1f)", cfg.nag_scale)
 
         try:
             # -- Chunk 0: Base generation at half-res --
@@ -478,6 +494,7 @@ class LTXVLongVideoService:
             accumulated = {"samples": video_state.latent}
             adain_reference = {"samples": accumulated["samples"].clone()}
             chunk0_latent = {"samples": accumulated["samples"].clone()}
+            accumulated_audio = audio_state.latent if audio_state.latent is not None else None
             del video_state, audio_state
 
             if progress_callback:
@@ -489,7 +506,7 @@ class LTXVLongVideoService:
                 # Per-chunk prompt override
                 vc, ac = chunk_contexts.get(chunk_idx, (v_ctx, a_ctx))
 
-                accumulated = extend_chunk(
+                accumulated, chunk_audio = extend_chunk(
                     prev_latent=accumulated,
                     pipeline=pipeline,
                     transformer=transformer,
@@ -505,6 +522,11 @@ class LTXVLongVideoService:
                     chunk_idx=chunk_idx,
                     pixel_width=gen_w,
                     pixel_height=gen_h,
+                )
+                # Accumulate audio across chunks
+                audio_overlap = temporal_overlap // 8
+                accumulated_audio = extend_audio_latent(
+                    accumulated_audio, chunk_audio, overlap=audio_overlap,
                 )
 
                 # Per-step AdaIN: apply chunk-level normalization against reference
@@ -531,6 +553,8 @@ class LTXVLongVideoService:
                     )
 
         finally:
+            if nag_patch is not None:
+                nag_patch.remove(transformer)
             xfm_runtime.shutdown()
             del xfm_runtime, transformer, xfm_inner
             gc.collect()
@@ -550,7 +574,11 @@ class LTXVLongVideoService:
             gc.collect()
             torch.cuda.empty_cache()
 
+        # Move audio to CPU
+        if accumulated_audio is not None:
+            accumulated_audio = accumulated_audio.cpu()
+
         del ledger
         gc.collect()
         torch.cuda.empty_cache()
-        return accumulated
+        return accumulated, accumulated_audio

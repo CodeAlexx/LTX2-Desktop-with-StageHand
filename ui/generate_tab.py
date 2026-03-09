@@ -565,7 +565,7 @@ class GenerateTab:
                 progress_cb(f"Chunk {chunk_idx + 1}/{total_chunks} ({frames_gen}/{total_frames}f)", frac * 0.85)
 
         service = LTXVLongVideoService()
-        accumulated = service.generate(
+        accumulated, accumulated_audio = service.generate(
             pipeline=self._pipeline,
             progress_callback=_progress_adapter,
             **kwargs,
@@ -584,6 +584,16 @@ class GenerateTab:
             generator,
         )
 
+        # Decode audio if available
+        decoded_audio = None
+        if accumulated_audio is not None:
+            from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
+            decoded_audio = vae_decode_audio(
+                accumulated_audio.to(self._pipeline.device),
+                ledger.audio_decoder(),
+                ledger.vocoder(),
+            )
+
         # Save
         out_dir = self.config.ensure_output_dir()
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -595,7 +605,7 @@ class GenerateTab:
         encode_video(
             video=decoded_video,
             fps=fps,
-            audio=None,
+            audio=decoded_audio,
             output_path=str(out_path),
             video_chunks_number=video_chunks_number,
         )
