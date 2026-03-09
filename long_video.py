@@ -143,23 +143,40 @@ def spatially_upscale_long_latent(
     video_encoder: Any,
     temporal_chunk_size: int = 25,
 ) -> dict:
-    """Apply spatial upscaler to a long latent in temporal chunks."""
+    """Apply spatial upscaler to a long latent in temporal chunks.
+
+    Runs on CUDA if available, falling back to CPU for Conv3d compatibility
+    (PyTorch slow_conv3d_forward has no CUDA kernel in some builds).
+    """
     from ltx_core.model.upsampler import upsample_video
 
     samples = latent["samples"]
     total_frames = samples.shape[2]
 
-    if total_frames <= temporal_chunk_size:
-        upscaled = upsample_video(samples, video_encoder, spatial_upscaler)
-        return {"samples": upscaled}
+    # Try CUDA first, fall back to CPU if slow_conv3d not available
+    device = next(spatial_upscaler.parameters()).device
+    try:
+        test_chunk = samples[:, :, :1].to(device)
+        _ = upsample_video(test_chunk, video_encoder, spatial_upscaler)
+        del test_chunk, _
+        run_device = device
+        logger.info("Spatial upscaler running on %s", run_device)
+    except NotImplementedError:
+        logger.warning("Conv3d not available on CUDA, falling back to CPU for spatial upscale")
+        spatial_upscaler = spatial_upscaler.cpu().float()
+        video_encoder = video_encoder.cpu().float()
+        run_device = torch.device("cpu")
 
     chunks = []
     pos = 0
     while pos < total_frames:
         end = min(pos + temporal_chunk_size, total_frames)
-        chunk = samples[:, :, pos:end]
+        chunk = samples[:, :, pos:end].to(run_device)
+        if run_device.type == "cpu":
+            chunk = chunk.float()
         upscaled_chunk = upsample_video(chunk, video_encoder, spatial_upscaler)
-        chunks.append(upscaled_chunk)
+        chunks.append(upscaled_chunk.cpu())
+        logger.info("Upscaled frames %d-%d / %d", pos, end, total_frames)
         pos = end
 
     return {"samples": torch.cat(chunks, dim=2)}
@@ -185,18 +202,19 @@ def extend_chunk(
     chunk_idx: int = 0,
     pixel_width: int | None = None,
     pixel_height: int | None = None,
-) -> dict:
-    """Extend a video by one temporal chunk.
+    prev_audio: torch.Tensor | None = None,
+) -> tuple[dict, torch.Tensor | None]:
+    """Extend a video by one temporal chunk using official conditioning API.
 
-    1. Extract last `overlap_frames` latent frames from prev_latent
-    2. Run base generation with overlap conditioning
-    3. Apply AdaIN normalization if factor > 0
-    4. Drop first output frame (8-frame artifact)
-    5. Linear blend into prev_latent at overlap region
+    Uses VideoConditionByLatentIndex to inject overlap frames at position 0,
+    which sets denoise_mask=0 so the noiser preserves them and the model sees
+    them as temporal context during attention. After generation, overlap frames
+    are discarded (exact copies) and only new frames are concatenated.
     """
     from ltx_core.components.diffusion_steps import EulerDiffusionStep
     from ltx_core.components.noisers import GaussianNoiser
-    from ltx_core.types import VideoPixelShape
+    from ltx_core.conditioning import VideoConditionByLatentIndex
+    from ltx_core.types import AudioLatentShape, VideoPixelShape
     from ltx_pipelines.utils.types import PipelineComponents
 
     if report is None:
@@ -211,9 +229,7 @@ def extend_chunk(
 
     total_pixel_frames = overlap_frames + num_new_frames
     valid_pixel_frames = ((total_pixel_frames - 1) // 8) * 8 + 1
-    overlap_tail = select_latents(prev_latent, -latent_overlap, -1)
 
-    # Use explicit pixel dims if provided, otherwise infer (VAE factor = 32)
     pw = pixel_width if pixel_width is not None else W * 32
     ph = pixel_height if pixel_height is not None else H * 32
 
@@ -225,48 +241,75 @@ def extend_chunk(
         fps=pipeline.config.fps,
     )
 
-    # Pad overlap tail to full chunk temporal size (required by create_initial_state)
-    target_latent_frames = (valid_pixel_frames - 1) // 8 + 1
-    overlap_samples = overlap_tail["samples"]
-    if overlap_samples.shape[2] < target_latent_frames:
-        pad_frames = target_latent_frames - overlap_samples.shape[2]
-        pad = torch.zeros(
-            B, C, pad_frames, H, W,
-            device=overlap_samples.device, dtype=overlap_samples.dtype,
-        )
-        padded = torch.cat([overlap_samples, pad], dim=2)
-    else:
-        padded = overlap_samples
+    # Extract overlap tail from accumulated video latent
+    overlap_tail = samples[:, :, -latent_overlap:].to(pipeline.device)
+
+    # Official conditioning: inject overlap at frame 0 with strength=1.0
+    # This sets denoise_mask=0 for overlap tokens BEFORE noising, so the
+    # noiser never touches them and post_process_latent preserves them.
+    conditioning = VideoConditionByLatentIndex(
+        latent=overlap_tail,
+        strength=1.0,
+        latent_idx=0,
+    )
+
+    # Prepare audio: pass overlap tail as initial_audio_latent (bias, not preserved)
+    audio_initial = None
+    audio_overlap_frames = 0
+    if prev_audio is not None:
+        audio_overlap_frames = overlap_frames
+        audio_target_shape = AudioLatentShape.from_video_pixel_shape(chunk_shape)
+        audio_target_frames = audio_target_shape.frames
+
+        audio_tail = prev_audio[:, :, -audio_overlap_frames:]
+        if audio_tail.shape[2] < audio_target_frames:
+            audio_pad = torch.zeros(
+                audio_tail.shape[0], audio_tail.shape[1],
+                audio_target_frames - audio_tail.shape[2],
+                audio_tail.shape[3],
+                device=audio_tail.device, dtype=audio_tail.dtype,
+            )
+            audio_initial = torch.cat([audio_tail, audio_pad], dim=2)
+        else:
+            audio_initial = audio_tail[:, :, :audio_target_frames]
 
     generator = torch.Generator(device=pipeline.device).manual_seed(seed + chunk_idx)
     noiser = GaussianNoiser(generator=generator)
     stepper = EulerDiffusionStep()
     components = PipelineComponents(dtype=pipeline.dtype, device=pipeline.device)
 
+    # Denoise via the same pipeline path as chunk 0, with overlap conditioning
     video_state, audio_state = pipeline._stagehand_denoise(
         transformer, xfm_runtime, v_ctx, a_ctx, chunk_shape, sigmas,
-        noiser, stepper, components, [],
-        report, label=f"Chunk {chunk_idx}", progress_base=0.0, progress_range=1.0,
-        noise_scale=sigmas[0].item(),
-        initial_video_latent=padded.to(pipeline.device),
+        noiser, stepper, components,
+        [conditioning],
+        report,
+        label=f"Chunk {chunk_idx}",
+        initial_audio_latent=audio_initial.to(pipeline.device) if audio_initial is not None else None,
     )
 
     new_chunk = {"samples": video_state.latent}
     new_audio = audio_state.latent if audio_state.latent is not None else None
     del video_state, audio_state
 
-    # Drop first frame (8-frame boundary artifact)
-    if new_chunk["samples"].shape[2] > 1:
-        new_chunk["samples"] = new_chunk["samples"][:, :, 1:]
-
-    # AdaIN normalization
+    # AdaIN normalization on new frames only (skip overlap)
     if adain_factor > 0.0 and adain_reference is not None:
-        new_chunk = adain_normalize(new_chunk, adain_reference, factor=adain_factor)
+        new_only = {"samples": new_chunk["samples"][:, :, latent_overlap:]}
+        new_only = adain_normalize(new_only, adain_reference, factor=adain_factor)
+        new_chunk["samples"] = torch.cat(
+            [new_chunk["samples"][:, :, :latent_overlap], new_only["samples"]], dim=2,
+        )
 
-    # Overlap shifted by 1 after first-frame drop
-    effective_overlap = max(latent_overlap - 1, 0)
-    blended = blend_latent_overlap(prev_latent, new_chunk, effective_overlap)
-    return blended, new_audio
+    # Discard overlap frames (preserved copies of accumulated tail)
+    new_frames = {"samples": new_chunk["samples"][:, :, latent_overlap:]}
+    result = {"samples": torch.cat([prev_latent["samples"], new_frames["samples"]], dim=2)}
+
+    # Discard audio overlap frames
+    if new_audio is not None and audio_overlap_frames > 0:
+        if audio_overlap_frames < new_audio.shape[2]:
+            new_audio = new_audio[:, :, audio_overlap_frames:]
+
+    return result, new_audio
 
 
 # -- Keyframe distribution --
@@ -371,6 +414,136 @@ class LTXVLongVideoService:
         temporal_overlap: 24 frames (pixel space)
         adain_factor: 0.3 (light normalization)
     """
+
+    def _stage2_refine(
+        self,
+        accumulated: dict,
+        pipeline: LTX2Pipeline,
+        ledger: Any,
+        v_ctx: torch.Tensor,
+        a_ctx: torch.Tensor | None,
+        nag_enabled: bool,
+        nag_v_ctx: torch.Tensor | None,
+        nag_a_ctx: torch.Tensor | None,
+        pixel_width: int,
+        pixel_height: int,
+        fps: float,
+        temporal_chunk_latent: int = 6,
+        temporal_overlap_latent: int = 2,
+    ) -> dict:
+        """Stage 2 refinement: 3 distilled steps on upscaled latent.
+
+        Matches pipeline._generate_two_stage Stage 2. Processes long latents
+        in overlapping temporal chunks with linear blending at boundaries
+        to prevent discontinuities.
+
+        Args:
+            temporal_chunk_latent: latent frames per chunk (6 ≈ 41 pixel frames)
+            temporal_overlap_latent: overlap in latent frames for blending (2 ≈ 17 pixel frames)
+        """
+        import gc
+        from ltx_core.components.diffusion_steps import EulerDiffusionStep
+        from ltx_core.components.noisers import GaussianNoiser
+        from ltx_core.types import VideoPixelShape
+        from ltx_pipelines.utils.constants import STAGE_2_DISTILLED_SIGMA_VALUES
+        from ltx_pipelines.utils.types import PipelineComponents
+
+        samples = accumulated["samples"]  # (B, C, T, H, W)
+        total_latent_frames = samples.shape[2]
+
+        s2_sigmas = torch.tensor(
+            STAGE_2_DISTILLED_SIGMA_VALUES, dtype=torch.float32, device=pipeline.device,
+        )
+
+        stride = temporal_chunk_latent - temporal_overlap_latent
+        logger.info(
+            "Stage 2 refinement: %d latent frames, %d steps, chunk=%d, overlap=%d, stride=%d",
+            total_latent_frames, len(s2_sigmas) - 1,
+            temporal_chunk_latent, temporal_overlap_latent, stride,
+        )
+
+        # Load transformer for Stage 2
+        transformer2, xfm_inner2, xfm_runtime2 = pipeline._setup_stagehand_transformer(ledger)
+
+        nag_patch2 = None
+        if nag_enabled and nag_v_ctx is not None:
+            from nag import NAGPatch
+            nag_patch2 = NAGPatch(
+                nag_v_ctx, nag_a_ctx,
+                pipeline.config.nag_scale, pipeline.config.nag_alpha, pipeline.config.nag_tau,
+            )
+            nag_patch2.apply(transformer2)
+            logger.info("NAG applied for Stage 2 refinement")
+
+        try:
+            # Accumulator: sum of weighted refined latents + weight map
+            B, C, T, H, W = samples.shape
+            result_sum = torch.zeros_like(samples)
+            weight_sum = torch.zeros(1, 1, T, 1, 1, dtype=samples.dtype, device=samples.device)
+
+            pos = 0
+            chunk_idx = 0
+            while pos < total_latent_frames:
+                end = min(pos + temporal_chunk_latent, total_latent_frames)
+                chunk_latent = samples[:, :, pos:end].to(pipeline.device)
+
+                n_latent = end - pos
+                n_pixel = (n_latent - 1) * 8 + 1
+
+                chunk_shape = VideoPixelShape(
+                    batch=1, frames=n_pixel,
+                    width=pixel_width * 2,
+                    height=pixel_height * 2,
+                    fps=fps,
+                )
+
+                generator = torch.Generator(device=pipeline.device).manual_seed(42)
+                noiser = GaussianNoiser(generator=generator)
+                stepper = EulerDiffusionStep()
+                components = PipelineComponents(dtype=pipeline.dtype, device=pipeline.device)
+
+                video_state, _ = pipeline._stagehand_denoise(
+                    transformer2, xfm_runtime2, v_ctx, a_ctx, chunk_shape, s2_sigmas,
+                    noiser, stepper, components, [],
+                    lambda msg, frac: None,
+                    label=f"Stage2 chunk {chunk_idx}",
+                    noise_scale=s2_sigmas[0].item(),
+                    initial_video_latent=chunk_latent,
+                )
+
+                refined = video_state.latent.cpu()
+                del video_state, chunk_latent
+
+                # Build per-frame weight: 1.0 in the middle, linear ramp at edges
+                w = torch.ones(n_latent, dtype=samples.dtype)
+                if pos > 0 and temporal_overlap_latent > 0:
+                    # Ramp up at start (overlap with previous chunk)
+                    ramp_len = min(temporal_overlap_latent, n_latent)
+                    w[:ramp_len] = torch.linspace(0, 1, ramp_len + 2, dtype=samples.dtype)[1:-1]
+                if end < total_latent_frames and temporal_overlap_latent > 0:
+                    # Ramp down at end (overlap with next chunk)
+                    ramp_len = min(temporal_overlap_latent, n_latent)
+                    w[-ramp_len:] = torch.linspace(1, 0, ramp_len + 2, dtype=samples.dtype)[1:-1]
+                w = w.reshape(1, 1, n_latent, 1, 1)
+
+                result_sum[:, :, pos:end] += refined * w
+                weight_sum[:, :, pos:end] += w
+
+                logger.info("Stage 2 refined frames %d-%d / %d", pos, end, total_latent_frames)
+                pos += stride
+                chunk_idx += 1
+
+        finally:
+            if nag_patch2 is not None:
+                nag_patch2.remove(transformer2)
+            xfm_runtime2.shutdown()
+            del xfm_runtime2, transformer2, xfm_inner2
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        # Normalize by weight (avoid div-by-zero)
+        weight_sum = weight_sum.clamp(min=1e-8)
+        return {"samples": result_sum / weight_sum}
 
     @torch.inference_mode()
     def generate(
@@ -506,6 +679,22 @@ class LTXVLongVideoService:
                 # Per-chunk prompt override
                 vc, ac = chunk_contexts.get(chunk_idx, (v_ctx, a_ctx))
 
+                # Last chunk gets maximum overlap for more context
+                is_last_chunk = (chunk_idx == num_chunks - 1)
+                if is_last_chunk and num_chunks > 2:
+                    # Double the overlap, capped so we still generate >=8 new frames
+                    chunk_overlap = min(temporal_overlap * 2, temporal_tile_size - 8)
+                    # Ensure it satisfies 8-frame alignment
+                    chunk_overlap = (chunk_overlap // 8) * 8
+                    chunk_new = temporal_tile_size - chunk_overlap
+                    logger.info(
+                        "Last chunk %d: boosted overlap %d→%d (new_frames=%d)",
+                        chunk_idx, temporal_overlap, chunk_overlap, chunk_new,
+                    )
+                else:
+                    chunk_overlap = temporal_overlap
+                    chunk_new = temporal_tile_size - temporal_overlap
+
                 accumulated, chunk_audio = extend_chunk(
                     prev_latent=accumulated,
                     pipeline=pipeline,
@@ -514,19 +703,19 @@ class LTXVLongVideoService:
                     v_ctx=vc,
                     a_ctx=ac,
                     sigmas=sigmas,
-                    overlap_frames=temporal_overlap,
-                    num_new_frames=temporal_tile_size - temporal_overlap,
+                    overlap_frames=chunk_overlap,
+                    num_new_frames=chunk_new,
                     adain_factor=adain_factor,
                     adain_reference=adain_reference,
                     seed=seed,
                     chunk_idx=chunk_idx,
                     pixel_width=gen_w,
                     pixel_height=gen_h,
+                    prev_audio=accumulated_audio,
                 )
-                # Accumulate audio across chunks
-                audio_overlap = temporal_overlap // 8
+                # Accumulate audio — overlap frames already discarded by extend_chunk
                 accumulated_audio = extend_audio_latent(
-                    accumulated_audio, chunk_audio, overlap=audio_overlap,
+                    accumulated_audio, chunk_audio, overlap=0,
                 )
 
                 # Per-step AdaIN: apply chunk-level normalization against reference
@@ -565,14 +754,25 @@ class LTXVLongVideoService:
 
         # Spatial upscale from half-res to full-res
         if upscale_mode != UpscaleMode.NONE:
-            logger.info("Upscaling accumulated latent from %dx%d to %dx%d...",
-                        gen_w, gen_h, width, height)
+            logger.info("Upscaling accumulated latent %s ...", tuple(accumulated["samples"].shape))
             ve = ledger.video_encoder()
             su = ledger.spatial_upsampler()
             accumulated = spatially_upscale_long_latent(accumulated, su, ve)
+            logger.info("Upscaled result: %s", tuple(accumulated["samples"].shape))
             del ve, su
             gc.collect()
             torch.cuda.empty_cache()
+
+            # =========================================================
+            # Stage 2: Refine upscaled latent (3 steps, distilled)
+            # Same as pipeline._generate_two_stage Stage 2 — adds detail
+            # that the initial 8-step generation cannot produce.
+            # =========================================================
+            accumulated = self._stage2_refine(
+                accumulated, pipeline, ledger, v_ctx, a_ctx,
+                nag_enabled, nag_v_ctx, nag_a_ctx,
+                width, height, fps,
+            )
 
         # Move audio to CPU
         if accumulated_audio is not None:
