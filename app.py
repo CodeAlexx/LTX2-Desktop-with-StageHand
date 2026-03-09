@@ -27,7 +27,7 @@ class LTX2App:
             config=self.config,
             on_change=self.generate_tab.invalidate_pipeline,
         )
-        self.settings_tab = SettingsTab(config=self.config)
+        self.settings_tab = SettingsTab(config=self.config, on_change=self.generate_tab.invalidate_pipeline)
 
     def build(self) -> None:
         dpg.create_context()
@@ -53,3 +53,9 @@ class LTX2App:
             dpg.render_dearpygui_frame()
 
         dpg.destroy_context()
+
+
+if __name__ == "__main__":
+    app = LTX2App()
+    app.build()
+    app.run()

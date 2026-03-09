@@ -25,6 +25,22 @@ class LoRATab:
             self._list_tag = dpg.add_group()
             dpg.add_separator()
             dpg.add_button(label="Apply to Config", callback=self._apply)
+        # Pre-populate from config defaults
+        for i, path in enumerate(self.config.lora_paths):
+            strength = self.config.lora_strengths[i] if i < len(self.config.lora_strengths) else 1.0
+            self._add_row_with_values(path, strength)
+
+    def _add_row_with_values(self, path: str = "", strength: float = 1.0) -> None:
+        with dpg.group(horizontal=True, parent=self._list_tag) as row:
+            path_tag = dpg.add_input_text(default_value=path, hint="Path to .safetensors", width=400)
+            strength_tag = dpg.add_input_float(default_value=strength, width=80, step=0)
+            dpg.add_button(label="Browse", callback=lambda: self._browse(path_tag))
+            dpg.add_button(
+                label="Remove",
+                callback=lambda s, a, u: self._remove_row(u),
+                user_data=(row, path_tag, strength_tag),
+            )
+            self._rows.append((path_tag, strength_tag))
 
     def _add_row(self) -> None:
         with dpg.group(horizontal=True, parent=self._list_tag) as row:
@@ -66,3 +82,4 @@ class LoRATab:
         # Invalidate cached pipeline so it reloads with new LoRAs
         if self._on_change:
             self._on_change()
+        self.config.save()

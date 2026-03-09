@@ -13,16 +13,19 @@ from inference_worker import InferenceWorker, WorkerState
 from ui.video_player import VideoPlayer
 
 
-# Duration presets in seconds -> frame count (n%8==1, at 24fps)
+# Duration presets in seconds -> frame count (n%8==1, at 25fps)
 DURATION_PRESETS = {
     "1s": 25,     # 1.0s
     "2s": 49,     # 2.0s
     "3s": 73,     # 3.0s
-    "4s": 97,     # 4.0s
     "5s": 121,    # 5.0s
-    "6s": 145,    # 6.0s
     "8s": 193,    # 8.0s
-    "10s": 241,   # 10.0s
+    "10s": 249,   # 10.0s
+    "15s": 377,   # 15.1s
+    "20s": 497,   # 19.9s
+    "30s": 753,   # 30.1s
+    "45s": 1121,  # 44.8s
+    "60s": 1497,  # 59.9s
 }
 
 # Resolution presets (w x h, both divisible by 32)
@@ -54,11 +57,35 @@ class GenerateTab:
         self._enhance_tag = None
         self._image_path_tag = None
         self._image_strength_tag = None
+        self._audio_path_tag = None
+        self._audio_start_tag = None
         self._progress_bar_tag = None
         self._phase_text_tag = None
         self._output_text_tag = None
         self._generate_btn_tag = None
         self._cancel_btn_tag = None
+
+        # CC prompt widget tags
+        self._scheduler_tag = None
+        self._two_stage_tag = None
+        self._two_stage_noise_tag = None
+        self._decoder_noise_tag = None
+        self._decoder_noise_scale_tag = None
+        self._decoder_noise_shift_tag = None
+        self._decoder_noise_seed_tag = None
+        self._zero_neg_cond_tag = None
+        self._preprocess_image_tag = None
+
+        # Four-pass / Long video widget tags
+        self._four_pass_tag = None
+        self._long_video_tag = None
+        self._long_video_group_tag = None
+        self._long_video_preset_tag = None
+        self._long_video_seconds_tag = None
+        self._long_video_tile_tag = None
+        self._long_video_overlap_tag = None
+        self._long_video_adain_tag = None
+        self._long_video_memory_tag = None
 
         # Dev mode widget tags
         self._negative_prompt_tag = None
@@ -113,6 +140,89 @@ class GenerateTab:
                     width=80, step=0, min_value=0.0, max_value=1.0,
                     min_clamped=True, max_clamped=True,
                 )
+
+            # A2V audio conditioning
+            dpg.add_text("Audio Conditioning (optional — mp3/wav/video with audio)")
+            with dpg.group(horizontal=True):
+                self._audio_path_tag = dpg.add_input_text(
+                    hint="Path to audio file", width=500,
+                    default_value=self.config.audio_path,
+                )
+                dpg.add_button(label="Browse", callback=self._browse_audio)
+                dpg.add_button(label="Clear", callback=lambda: dpg.set_value(self._audio_path_tag, ""))
+            with dpg.group(horizontal=True):
+                dpg.add_text("Start (s)")
+                self._audio_start_tag = dpg.add_input_float(
+                    default_value=self.config.audio_start_time,
+                    width=60, step=0, min_value=0.0, min_clamped=True,
+                )
+
+            dpg.add_separator()
+
+            # I2V-only options
+            with dpg.group(horizontal=True):
+                self._zero_neg_cond_tag = dpg.add_checkbox(
+                    label="Zero negative conditioning (I2V only)",
+                    default_value=self.config.zero_negative_conditioning,
+                )
+                self._preprocess_image_tag = dpg.add_checkbox(
+                    label="Preprocess input image (I2V only)",
+                    default_value=self.config.preprocess_input_image,
+                )
+
+            dpg.add_separator()
+
+            # Four-pass & Long video
+            self._four_pass_tag = dpg.add_checkbox(
+                label="Four-pass pipeline (spatial + temporal upscale + refinement)",
+                default_value=self.config.use_four_pass,
+            )
+
+            self._long_video_tag = dpg.add_checkbox(
+                label="Long video (temporal tiling)",
+                default_value=self.config.long_video_enabled,
+                callback=self._toggle_long_video,
+            )
+
+            self._long_video_group_tag = dpg.add_group(show=self.config.long_video_enabled)
+            with dpg.group(parent=self._long_video_group_tag):
+                with dpg.group(horizontal=True):
+                    dpg.add_text("Preset")
+                    self._long_video_preset_tag = dpg.add_combo(
+                        items=["quality", "balanced", "fast", "two_minute", "max_length"],
+                        default_value=self.config.long_video_preset,
+                        width=140,
+                        callback=self._apply_preset,
+                    )
+                    dpg.add_text("  Total seconds")
+                    self._long_video_seconds_tag = dpg.add_input_float(
+                        default_value=self.config.long_video_total_seconds,
+                        width=80, step=0, min_value=1.0, min_clamped=True,
+                    )
+
+                with dpg.group(horizontal=True):
+                    dpg.add_text("Tile size")
+                    self._long_video_tile_tag = dpg.add_input_int(
+                        default_value=self.config.long_video_temporal_tile_size,
+                        width=60, step=0,
+                    )
+                    dpg.add_text("  Overlap")
+                    self._long_video_overlap_tag = dpg.add_input_int(
+                        default_value=self.config.long_video_temporal_overlap,
+                        width=60, step=0,
+                    )
+                    dpg.add_text("  AdaIN")
+                    self._long_video_adain_tag = dpg.add_input_float(
+                        default_value=self.config.long_video_adain_factor,
+                        width=60, step=0, min_value=0.0, max_value=1.0,
+                        min_clamped=True, max_clamped=True,
+                    )
+                    dpg.add_text("  Memory")
+                    self._long_video_memory_tag = dpg.add_input_float(
+                        default_value=self.config.long_video_long_memory_strength,
+                        width=60, step=0, min_value=0.0, max_value=1.0,
+                        min_clamped=True, max_clamped=True,
+                    )
 
             dpg.add_separator()
 
@@ -206,6 +316,49 @@ class GenerateTab:
 
             dpg.add_separator()
 
+            # === CC Prompt Controls ===
+            with dpg.group(horizontal=True):
+                dpg.add_text("Scheduler")
+                self._scheduler_tag = dpg.add_combo(
+                    items=["default", "bong_tangent"],
+                    default_value=self.config.scheduler_type,
+                    width=140,
+                )
+
+            with dpg.group(horizontal=True):
+                self._two_stage_tag = dpg.add_checkbox(
+                    label="Two-stage sampling",
+                    default_value=self.config.two_stage_sampling,
+                )
+                dpg.add_text("  Noise strength")
+                self._two_stage_noise_tag = dpg.add_input_float(
+                    default_value=self.config.two_stage_noise_strength,
+                    width=60, step=0, min_value=0.0, min_clamped=True,
+                )
+
+            with dpg.group(horizontal=True):
+                self._decoder_noise_tag = dpg.add_checkbox(
+                    label="VAE decoder noise",
+                    default_value=self.config.decoder_noise_enabled,
+                )
+                dpg.add_text("  Scale")
+                self._decoder_noise_scale_tag = dpg.add_input_float(
+                    default_value=self.config.decoder_noise_scale,
+                    width=60, step=0,
+                )
+                dpg.add_text("  Shift")
+                self._decoder_noise_shift_tag = dpg.add_input_float(
+                    default_value=self.config.decoder_noise_shift,
+                    width=60, step=0,
+                )
+                dpg.add_text("  Seed")
+                self._decoder_noise_seed_tag = dpg.add_input_int(
+                    default_value=self.config.decoder_noise_seed,
+                    width=80, step=0,
+                )
+
+            dpg.add_separator()
+
             # Generate / Cancel
             with dpg.group(horizontal=True):
                 self._generate_btn_tag = dpg.add_button(
@@ -243,6 +396,32 @@ class GenerateTab:
             dpg.add_file_extension(".jpeg", color=(0, 255, 0, 255))
             dpg.add_file_extension(".webp", color=(0, 255, 0, 255))
 
+    def _browse_audio(self) -> None:
+        def _selected(sender, app_data):
+            selections = app_data.get("selections", {})
+            if selections:
+                dpg.set_value(self._audio_path_tag, list(selections.values())[0])
+
+        with dpg.file_dialog(callback=_selected, width=700, height=400, show=True):
+            dpg.add_file_extension(".mp3", color=(0, 200, 255, 255))
+            dpg.add_file_extension(".wav", color=(0, 200, 255, 255))
+            dpg.add_file_extension(".flac", color=(0, 200, 255, 255))
+            dpg.add_file_extension(".mp4", color=(0, 255, 0, 255))
+
+    def _toggle_long_video(self, sender=None, app_data=None) -> None:
+        show = dpg.get_value(self._long_video_tag)
+        dpg.configure_item(self._long_video_group_tag, show=show)
+
+    def _apply_preset(self, sender=None, app_data=None) -> None:
+        from long_video_presets import PRESETS
+        preset_name = dpg.get_value(self._long_video_preset_tag)
+        preset = PRESETS.get(preset_name)
+        if preset:
+            dpg.set_value(self._long_video_tile_tag, preset["temporal_tile_size"])
+            dpg.set_value(self._long_video_overlap_tag, preset["temporal_overlap"])
+            dpg.set_value(self._long_video_adain_tag, preset["adain_factor"])
+            dpg.set_value(self._long_video_memory_tag, preset.get("long_memory_strength", 0.0))
+
     def _randomize_seed(self) -> None:
         dpg.set_value(self._seed_tag, random.randint(0, 2**31 - 1))
 
@@ -275,6 +454,8 @@ class GenerateTab:
         enhance = dpg.get_value(self._enhance_tag)
         image_path = dpg.get_value(self._image_path_tag).strip()
         image_strength = dpg.get_value(self._image_strength_tag)
+        audio_path = dpg.get_value(self._audio_path_tag).strip()
+        audio_start = dpg.get_value(self._audio_start_tag)
 
         # Dev mode params
         negative_prompt = dpg.get_value(self._negative_prompt_tag).strip()
@@ -289,6 +470,29 @@ class GenerateTab:
         v2a_scale = dpg.get_value(self._v2a_tag)
         stg_blocks = self._parse_stg_blocks()
 
+        # CC prompt settings
+        scheduler_type = dpg.get_value(self._scheduler_tag)
+        two_stage = dpg.get_value(self._two_stage_tag)
+        two_stage_noise = dpg.get_value(self._two_stage_noise_tag)
+        decoder_noise = dpg.get_value(self._decoder_noise_tag)
+        decoder_noise_scale = dpg.get_value(self._decoder_noise_scale_tag)
+        decoder_noise_shift = dpg.get_value(self._decoder_noise_shift_tag)
+        decoder_noise_seed = dpg.get_value(self._decoder_noise_seed_tag)
+        zero_neg_cond = dpg.get_value(self._zero_neg_cond_tag)
+        preprocess_image = dpg.get_value(self._preprocess_image_tag)
+
+        # Update config with generation settings
+        self.config.use_four_pass = dpg.get_value(self._four_pass_tag)
+        self.config.scheduler_type = scheduler_type
+        self.config.two_stage_sampling = two_stage
+        self.config.two_stage_noise_strength = two_stage_noise
+        self.config.decoder_noise_enabled = decoder_noise
+        self.config.decoder_noise_scale = decoder_noise_scale
+        self.config.decoder_noise_shift = decoder_noise_shift
+        self.config.decoder_noise_seed = decoder_noise_seed
+        self.config.zero_negative_conditioning = zero_neg_cond
+        self.config.preprocess_input_image = preprocess_image
+
         # Lazy-create pipeline (invalidate if config changed)
         if self._pipeline is None:
             self._pipeline = self.pipeline_factory()
@@ -296,29 +500,106 @@ class GenerateTab:
         dpg.configure_item(self._generate_btn_tag, enabled=False)
         dpg.configure_item(self._cancel_btn_tag, enabled=True)
 
-        self.worker.submit(
-            self._pipeline.generate,
-            prompt=prompt,
-            seed=seed,
-            width=w,
-            height=h,
-            num_frames=nf,
-            fps=fps,
-            enhance_prompt=enhance,
-            image_path=image_path or None,
-            image_strength=image_strength,
-            negative_prompt=negative_prompt or None,
-            num_inference_steps=num_inference_steps,
-            video_cfg_scale=video_cfg_scale,
-            video_stg_scale=video_stg_scale,
-            video_rescale=video_rescale,
-            audio_cfg_scale=audio_cfg_scale,
-            audio_stg_scale=audio_stg_scale,
-            audio_rescale=audio_rescale,
-            a2v_scale=a2v_scale,
-            v2a_scale=v2a_scale,
-            stg_blocks=stg_blocks,
+        # Check if long video mode
+        if dpg.get_value(self._long_video_tag):
+            from long_video import LTXVLongVideoService
+            from long_video_presets import seconds_to_frames
+
+            total_seconds = dpg.get_value(self._long_video_seconds_tag)
+            total_frames = seconds_to_frames(total_seconds, fps)
+
+            self.worker.submit(
+                self._run_long_video,
+                prompt=prompt,
+                seed=seed,
+                width=w,
+                height=h,
+                total_frames=total_frames,
+                fps=fps,
+                temporal_tile_size=dpg.get_value(self._long_video_tile_tag),
+                temporal_overlap=dpg.get_value(self._long_video_overlap_tag),
+                adain_factor=dpg.get_value(self._long_video_adain_tag),
+                long_memory_strength=dpg.get_value(self._long_video_memory_tag),
+                per_step_adain=self.config.long_video_per_step_adain,
+                per_step_adain_factors=self.config.long_video_per_step_adain_factors,
+            )
+        else:
+            self.worker.submit(
+                self._pipeline.generate,
+                prompt=prompt,
+                seed=seed,
+                width=w,
+                height=h,
+                num_frames=nf,
+                fps=fps,
+                enhance_prompt=enhance,
+                image_path=image_path or None,
+                image_strength=image_strength,
+                audio_path=audio_path or None,
+                audio_start_time=audio_start,
+                negative_prompt=negative_prompt or None,
+                num_inference_steps=num_inference_steps,
+                video_cfg_scale=video_cfg_scale,
+                video_stg_scale=video_stg_scale,
+                video_rescale=video_rescale,
+                audio_cfg_scale=audio_cfg_scale,
+                audio_stg_scale=audio_stg_scale,
+                audio_rescale=audio_rescale,
+                a2v_scale=a2v_scale,
+                v2a_scale=v2a_scale,
+                stg_blocks=stg_blocks,
+            )
+
+    def _run_long_video(self, progress_cb=None, **kwargs) -> Path:
+        """Run long video generation and decode/save the result."""
+        from long_video import LTXVLongVideoService
+        from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
+        from ltx_core.model.video_vae import decode_video as vae_decode_video
+        from ltx_pipelines.utils.media_io import encode_video
+        import datetime
+
+        # Adapt progress_cb (phase, frac) to long video callback (chunk, total, frames, total_frames, elapsed)
+        def _progress_adapter(chunk_idx, total_chunks, frames_gen, total_frames, elapsed):
+            if progress_cb:
+                frac = (chunk_idx + 1) / total_chunks
+                progress_cb(f"Chunk {chunk_idx + 1}/{total_chunks} ({frames_gen}/{total_frames}f)", frac * 0.85)
+
+        service = LTXVLongVideoService()
+        accumulated = service.generate(
+            pipeline=self._pipeline,
+            progress_callback=_progress_adapter,
+            **kwargs,
         )
+
+        # Decode accumulated latent to video
+        ledger = self._pipeline._build_ledger()
+        import torch
+        generator = torch.Generator(device=self._pipeline.device).manual_seed(kwargs.get("seed", 42))
+        tiling = TilingConfig.default()
+
+        decoded_video = vae_decode_video(
+            accumulated["samples"],
+            ledger.video_decoder(),
+            tiling,
+            generator,
+        )
+
+        # Save
+        out_dir = self.config.ensure_output_dir()
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        fps = kwargs.get("fps", 25.0)
+        out_path = out_dir / f"ltx2_longvideo_{ts}.mp4"
+
+        nf = accumulated["samples"].shape[2] * 8 + 1
+        video_chunks_number = get_video_chunks_number(nf, tiling)
+        encode_video(
+            video=decoded_video,
+            fps=fps,
+            audio=None,
+            output_path=str(out_path),
+            video_chunks_number=video_chunks_number,
+        )
+        return out_path
 
     def _on_cancel(self) -> None:
         self.worker.cancel()

@@ -474,7 +474,7 @@ class VideoPlayer:
             # Still check for dirty frame from seek/load
             with self._lock:
                 if self._frame_dirty and self._pending_frame is not None:
-                    dpg.set_value(self._texture_tag, self._pending_frame.tolist())
+                    dpg.set_value(self._texture_tag, self._pending_frame)
                     self._frame_dirty = False
             return
 
@@ -500,7 +500,7 @@ class VideoPlayer:
             latest_data = data
 
         if latest_data is not None:
-            dpg.set_value(self._texture_tag, latest_data.tolist())
+            dpg.set_value(self._texture_tag, latest_data)
             self._current_pts = latest_pts
             dpg.set_value(self._seek_slider_tag, self._current_pts)
             self._update_time_label()
