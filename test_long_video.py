@@ -413,7 +413,7 @@ def test_config_long_video_fields():
     assert cfg.long_video_preset == "balanced"
     assert cfg.long_video_temporal_tile_size == 80
     assert cfg.long_video_temporal_overlap == 24
-    assert cfg.long_video_adain_factor == 0.3
+    assert cfg.long_video_adain_factor == 0.0
     assert cfg.long_video_per_step_adain is False
     assert cfg.long_video_long_memory_strength == 0.0
 

@@ -31,6 +31,265 @@ class UpscaleMode(str, Enum):
     SPATIAL_FINAL = "spatial_final"
 
 
+def _build_long_video_ledgers(pipeline: LTX2Pipeline) -> tuple[Any, Any, Any]:
+    """Build the base/stage1/stage2 ledgers, honoring HQ transformer overrides."""
+    cfg = pipeline.config
+
+    if cfg.hq_sampler_enabled:
+        from hq_runtime_loader import attach_runtime_lora_merge
+
+        hq_dev_checkpoint = cfg.resolve_hq_dev_checkpoint_path()
+        hq_s1_checkpoint, hq_s2_checkpoint = cfg.resolve_hq_transformer_checkpoint_paths()
+        logger.info("Long video HQ using dev checkpoint: %s", hq_dev_checkpoint)
+
+        base_ledger = pipeline._build_ledger(
+            checkpoint_override=hq_dev_checkpoint,
+            skip_user_loras=True,
+        )
+
+        if hq_s1_checkpoint and hq_s2_checkpoint:
+            logger.info(
+                "Long video HQ using premerged BF16 transformer checkpoints: %s | %s",
+                hq_s1_checkpoint,
+                hq_s2_checkpoint,
+            )
+            ledger_stage1 = pipeline._build_ledger(
+                checkpoint_override=hq_s1_checkpoint,
+                skip_user_loras=True,
+            )
+            ledger_s2 = pipeline._build_ledger(
+                checkpoint_override=hq_s2_checkpoint,
+                skip_user_loras=True,
+            )
+        else:
+            ledger_stage1 = pipeline._build_ledger(
+                checkpoint_override=hq_dev_checkpoint,
+                skip_user_loras=True,
+            )
+            attach_runtime_lora_merge(
+                ledger_stage1,
+                lora_path=cfg.distilled_lora_path,
+                strength=cfg.hq_distilled_lora_strength_s1,
+            )
+            ledger_s2 = pipeline._build_ledger(
+                checkpoint_override=hq_dev_checkpoint,
+                skip_user_loras=True,
+            )
+            attach_runtime_lora_merge(
+                ledger_s2,
+                lora_path=cfg.distilled_lora_path,
+                strength=cfg.hq_distilled_lora_strength_s2,
+            )
+        return base_ledger, ledger_stage1, ledger_s2
+
+    base_ledger = pipeline._build_ledger()
+    ledger_stage1 = base_ledger
+    ledger_s2 = pipeline._build_ledger(with_distilled_lora=True) if not cfg.is_distilled else base_ledger
+    return base_ledger, ledger_stage1, ledger_s2
+
+
+def _build_long_video_guidance(
+    pipeline: LTX2Pipeline,
+) -> tuple[str | None, Any, Any]:
+    """Return negative prompt and guider params for chunk generation."""
+    cfg = pipeline.config
+    neg_prompt = cfg.negative_prompt if (cfg.hq_sampler_enabled or not cfg.is_distilled) else None
+
+    video_guider_params = None
+    audio_guider_params = None
+
+    if cfg.hq_sampler_enabled:
+        from ltx_core.components.guiders import MultiModalGuiderParams
+        from ltx_pipelines.utils.constants import LTX_2_3_HQ_PARAMS
+
+        hq_video = LTX_2_3_HQ_PARAMS.video_guider_params
+        hq_audio = LTX_2_3_HQ_PARAMS.audio_guider_params
+        video_guider_params = MultiModalGuiderParams(
+            cfg_scale=hq_video.cfg_scale,
+            stg_scale=hq_video.stg_scale,
+            rescale_scale=hq_video.rescale_scale,
+            modality_scale=hq_video.modality_scale,
+            skip_step=hq_video.skip_step,
+            stg_blocks=list(hq_video.stg_blocks),
+        )
+        audio_guider_params = MultiModalGuiderParams(
+            cfg_scale=hq_audio.cfg_scale,
+            stg_scale=hq_audio.stg_scale,
+            rescale_scale=hq_audio.rescale_scale,
+            modality_scale=hq_audio.modality_scale,
+            skip_step=hq_audio.skip_step,
+            stg_blocks=list(hq_audio.stg_blocks),
+        )
+    elif not cfg.is_distilled:
+        from ltx_core.components.guiders import MultiModalGuiderParams
+
+        video_guider_params = MultiModalGuiderParams(
+            cfg_scale=cfg.video_cfg_scale,
+            stg_scale=cfg.video_stg_scale,
+            rescale_scale=cfg.video_rescale,
+            modality_scale=cfg.a2v_scale,
+            skip_step=0,
+            stg_blocks=cfg.stg_blocks,
+        )
+        audio_guider_params = MultiModalGuiderParams(
+            cfg_scale=cfg.audio_cfg_scale,
+            stg_scale=cfg.audio_stg_scale,
+            rescale_scale=cfg.audio_rescale,
+            modality_scale=cfg.v2a_scale,
+            skip_step=0,
+            stg_blocks=cfg.stg_blocks,
+        )
+
+    return neg_prompt, video_guider_params, audio_guider_params
+
+
+def _collect_long_video_images(
+    cfg: Any,
+    actual_total_frames: int,
+    image_path: str | None,
+    image_strength: float | None,
+) -> list[Any]:
+    """Build the absolute image-conditioning list for long-video generation."""
+    from ltx_pipelines.utils.args import ImageConditioningInput
+
+    effective_crf = cfg.image_crf if cfg.preprocess_input_image else 0
+    images: list[Any] = []
+
+    img_path = image_path or cfg.image_path
+    img_strength = image_strength if image_strength is not None else cfg.image_strength
+    if img_path:
+        images.append(
+            ImageConditioningInput(
+                path=img_path,
+                frame_idx=0,
+                strength=img_strength,
+                crf=effective_crf,
+            )
+        )
+    elif cfg.keyframe_first_path:
+        images.append(
+            ImageConditioningInput(
+                path=cfg.keyframe_first_path,
+                frame_idx=0,
+                strength=cfg.keyframe_first_strength,
+                crf=effective_crf,
+            )
+        )
+
+    middle_idx = max(0, min(actual_total_frames - 1, (actual_total_frames - 1) // 2))
+    if cfg.keyframe_middle_path:
+        images.append(
+            ImageConditioningInput(
+                path=cfg.keyframe_middle_path,
+                frame_idx=middle_idx,
+                strength=cfg.keyframe_middle_strength,
+                crf=effective_crf,
+            )
+        )
+    if cfg.keyframe_last_path and actual_total_frames > 1:
+        images.append(
+            ImageConditioningInput(
+                path=cfg.keyframe_last_path,
+                frame_idx=actual_total_frames - 1,
+                strength=cfg.keyframe_last_strength,
+                crf=effective_crf,
+            )
+        )
+
+    return images
+
+
+def _distribute_images_to_chunks(
+    images: list[Any],
+    total_frames: int,
+    temporal_tile_size: int,
+    temporal_overlap: int,
+) -> dict[int, list[Any]]:
+    """Map absolute frame-conditioned images into chunk-local frame indices."""
+    if not images:
+        return {}
+
+    from ltx_pipelines.utils.args import ImageConditioningInput
+
+    distributed = distribute_keyframes_to_chunks(
+        [(img.frame_idx, img) for img in images],
+        total_frames=total_frames,
+        temporal_tile_size=temporal_tile_size,
+        temporal_overlap=temporal_overlap,
+    )
+    chunk_images: dict[int, list[Any]] = {}
+    for chunk_idx, entries in distributed.items():
+        chunk_images[chunk_idx] = [
+            ImageConditioningInput(
+                path=img.path,
+                frame_idx=in_chunk_idx,
+                strength=img.strength,
+                crf=img.crf,
+            )
+            for in_chunk_idx, img in entries
+        ]
+    return chunk_images
+
+
+def _make_stage1_sampler(
+    pipeline: LTX2Pipeline,
+    shape: Any,
+) -> tuple[torch.Tensor, Any, bool]:
+    """Build the stage-1 sigma schedule and stepper for a chunk shape."""
+    cfg = pipeline.config
+
+    if cfg.hq_sampler_enabled:
+        from ltx_core.components.diffusion_steps import Res2sDiffusionStep
+        from ltx_core.components.schedulers import LTX2Scheduler
+        from ltx_core.types import VideoLatentShape
+
+        empty_latent = torch.empty(VideoLatentShape.from_pixel_shape(shape).to_torch_shape())
+        sigmas = LTX2Scheduler().execute(
+            latent=empty_latent,
+            steps=cfg.hq_num_inference_steps,
+        ).to(dtype=torch.float32, device=pipeline.device)
+        return sigmas, Res2sDiffusionStep(), True
+
+    from ltx_core.components.diffusion_steps import EulerDiffusionStep
+
+    if cfg.is_distilled:
+        from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES
+
+        sigmas = torch.tensor(
+            DISTILLED_SIGMA_VALUES,
+            dtype=torch.float32,
+            device=pipeline.device,
+        )
+    else:
+        from ltx_core.components.schedulers import LTX2Scheduler
+
+        sigmas = LTX2Scheduler().execute(
+            steps=cfg.num_inference_steps,
+        ).to(dtype=torch.float32, device=pipeline.device)
+
+    return sigmas, EulerDiffusionStep(), False
+
+
+def _make_stage2_sampler(pipeline: LTX2Pipeline) -> tuple[torch.Tensor, Any, bool]:
+    """Build the stage-2 sigma schedule and stepper."""
+    from ltx_pipelines.utils.constants import STAGE_2_DISTILLED_SIGMA_VALUES
+
+    sigmas = torch.tensor(
+        STAGE_2_DISTILLED_SIGMA_VALUES,
+        dtype=torch.float32,
+        device=pipeline.device,
+    )
+
+    if pipeline.config.hq_sampler_enabled:
+        from ltx_core.components.diffusion_steps import Res2sDiffusionStep
+
+        return sigmas, Res2sDiffusionStep(), True
+
+    from ltx_core.components.diffusion_steps import EulerDiffusionStep
+
+    return sigmas, EulerDiffusionStep(), False
+
+
 # -- Latent utilities --
 
 
@@ -192,7 +451,6 @@ def extend_chunk(
     xfm_runtime: Any,
     v_ctx: torch.Tensor,
     a_ctx: torch.Tensor | None,
-    sigmas: torch.Tensor,
     overlap_frames: int = 24,
     num_new_frames: int = 80,
     adain_factor: float = 0.0,
@@ -203,6 +461,12 @@ def extend_chunk(
     pixel_width: int | None = None,
     pixel_height: int | None = None,
     prev_audio: torch.Tensor | None = None,
+    anchor_latent: torch.Tensor | None = None,
+    extra_conditionings: list | None = None,
+    v_ctx_neg: torch.Tensor | None = None,
+    a_ctx_neg: torch.Tensor | None = None,
+    video_guider_params: Any | None = None,
+    audio_guider_params: Any | None = None,
 ) -> tuple[dict, torch.Tensor | None]:
     """Extend a video by one temporal chunk using official conditioning API.
 
@@ -210,10 +474,14 @@ def extend_chunk(
     which sets denoise_mask=0 so the noiser preserves them and the model sees
     them as temporal context during attention. After generation, overlap frames
     are discarded (exact copies) and only new frames are concatenated.
+
+    If anchor_latent is provided (e.g. first frame from chunk 0), it is appended
+    to the sequence as extra context via VideoConditionByKeyframeIndex. The model
+    can attend to it for identity reference without replacing any generated frames.
     """
-    from ltx_core.components.diffusion_steps import EulerDiffusionStep
     from ltx_core.components.noisers import GaussianNoiser
     from ltx_core.conditioning import VideoConditionByLatentIndex
+    from ltx_core.conditioning.types.keyframe_cond import VideoConditionByKeyframeIndex
     from ltx_core.types import AudioLatentShape, VideoPixelShape
     from ltx_pipelines.utils.types import PipelineComponents
 
@@ -240,6 +508,7 @@ def extend_chunk(
         height=ph,
         fps=pipeline.config.fps,
     )
+    sigmas, stepper, use_res2s = _make_stage1_sampler(pipeline, chunk_shape)
 
     # Extract overlap tail from accumulated video latent
     overlap_tail = samples[:, :, -latent_overlap:].to(pipeline.device)
@@ -247,11 +516,39 @@ def extend_chunk(
     # Official conditioning: inject overlap at frame 0 with strength=1.0
     # This sets denoise_mask=0 for overlap tokens BEFORE noising, so the
     # noiser never touches them and post_process_latent preserves them.
-    conditioning = VideoConditionByLatentIndex(
-        latent=overlap_tail,
-        strength=1.0,
-        latent_idx=0,
-    )
+    conditionings: list = [
+        VideoConditionByLatentIndex(
+            latent=overlap_tail,
+            strength=1.0,
+            latent_idx=0,
+        ),
+    ]
+
+    # Anchor conditioning: append chunk 0 reference frames as extra context
+    # tokens via VideoConditionByKeyframeIndex. These are appended to the
+    # sequence (not replacing any frames) so the model can attend to them
+    # for character/scene identity without consuming generated frame slots.
+    if anchor_latent is not None:
+        conditionings.append(
+            VideoConditionByKeyframeIndex(
+                keyframes=anchor_latent.to(pipeline.device),
+                frame_idx=0,
+                strength=1.0,
+            ),
+        )
+        logger.info(
+            "Chunk %d: anchor conditioning %s appended (%d extra tokens)",
+            chunk_idx, tuple(anchor_latent.shape),
+            anchor_latent.shape[2] * (anchor_latent.shape[3] * anchor_latent.shape[4]),
+        )
+
+    if extra_conditionings:
+        conditionings.extend(extra_conditionings)
+        logger.info(
+            "Chunk %d: appended %d chunk-local guide conditioning item(s)",
+            chunk_idx,
+            len(extra_conditionings),
+        )
 
     # Prepare audio: pass overlap tail as initial_audio_latent (bias, not preserved)
     audio_initial = None
@@ -275,17 +572,22 @@ def extend_chunk(
 
     generator = torch.Generator(device=pipeline.device).manual_seed(seed + chunk_idx)
     noiser = GaussianNoiser(generator=generator)
-    stepper = EulerDiffusionStep()
     components = PipelineComponents(dtype=pipeline.dtype, device=pipeline.device)
 
-    # Denoise via the same pipeline path as chunk 0, with overlap conditioning
+    # Denoise via the same pipeline path as chunk 0, with overlap + anchor conditioning
     video_state, audio_state = pipeline._stagehand_denoise(
         transformer, xfm_runtime, v_ctx, a_ctx, chunk_shape, sigmas,
         noiser, stepper, components,
-        [conditioning],
+        conditionings,
         report,
         label=f"Chunk {chunk_idx}",
         initial_audio_latent=audio_initial.to(pipeline.device) if audio_initial is not None else None,
+        v_ctx_neg=v_ctx_neg,
+        a_ctx_neg=a_ctx_neg,
+        video_guider_params=video_guider_params,
+        audio_guider_params=audio_guider_params,
+        use_res2s=use_res2s,
+        noise_seed=seed + chunk_idx,
     )
 
     new_chunk = {"samples": video_state.latent}
@@ -304,12 +606,13 @@ def extend_chunk(
     new_frames = {"samples": new_chunk["samples"][:, :, latent_overlap:]}
     result = {"samples": torch.cat([prev_latent["samples"], new_frames["samples"]], dim=2)}
 
-    # Discard audio overlap frames
-    if new_audio is not None and audio_overlap_frames > 0:
-        if audio_overlap_frames < new_audio.shape[2]:
-            new_audio = new_audio[:, :, audio_overlap_frames:]
+    merged_audio = extend_audio_latent(
+        prev_audio,
+        new_audio,
+        overlap=audio_overlap_frames,
+    )
 
-    return result, new_audio
+    return result, merged_audio
 
 
 # -- Keyframe distribution --
@@ -428,8 +731,10 @@ class LTXVLongVideoService:
         pixel_width: int,
         pixel_height: int,
         fps: float,
+        seed: int = 42,
         temporal_chunk_latent: int = 6,
         temporal_overlap_latent: int = 2,
+        conditionings: list | None = None,
     ) -> dict:
         """Stage 2 refinement: 3 distilled steps on upscaled latent.
 
@@ -442,18 +747,14 @@ class LTXVLongVideoService:
             temporal_overlap_latent: overlap in latent frames for blending (2 ≈ 17 pixel frames)
         """
         import gc
-        from ltx_core.components.diffusion_steps import EulerDiffusionStep
         from ltx_core.components.noisers import GaussianNoiser
         from ltx_core.types import VideoPixelShape
-        from ltx_pipelines.utils.constants import STAGE_2_DISTILLED_SIGMA_VALUES
         from ltx_pipelines.utils.types import PipelineComponents
 
         samples = accumulated["samples"]  # (B, C, T, H, W)
         total_latent_frames = samples.shape[2]
 
-        s2_sigmas = torch.tensor(
-            STAGE_2_DISTILLED_SIGMA_VALUES, dtype=torch.float32, device=pipeline.device,
-        )
+        s2_sigmas, stepper, use_res2s = _make_stage2_sampler(pipeline)
 
         stride = temporal_chunk_latent - temporal_overlap_latent
         logger.info(
@@ -497,18 +798,19 @@ class LTXVLongVideoService:
                     fps=fps,
                 )
 
-                generator = torch.Generator(device=pipeline.device).manual_seed(42)
+                generator = torch.Generator(device=pipeline.device).manual_seed(seed + chunk_idx)
                 noiser = GaussianNoiser(generator=generator)
-                stepper = EulerDiffusionStep()
                 components = PipelineComponents(dtype=pipeline.dtype, device=pipeline.device)
 
                 video_state, _ = pipeline._stagehand_denoise(
                     transformer2, xfm_runtime2, v_ctx, a_ctx, chunk_shape, s2_sigmas,
-                    noiser, stepper, components, [],
+                    noiser, stepper, components, conditionings or [],
                     lambda msg, frac: None,
                     label=f"Stage2 chunk {chunk_idx}",
                     noise_scale=s2_sigmas[0].item(),
                     initial_video_latent=chunk_latent,
+                    use_res2s=use_res2s,
+                    noise_seed=seed + chunk_idx,
                 )
 
                 refined = video_state.latent.cpu()
@@ -564,27 +866,34 @@ class LTXVLongVideoService:
         per_step_adain_factors: str = "0.9,0.75,0.5,0.25,0.0,0.0,0.0,0.0",
         per_chunk_prompts: list[str] | None = None,
         progress_callback: Callable[[int, int, int, int, float], None] | None = None,
+        anchor_frames: int = 1,
+        image_path: str | None = None,
+        image_strength: float | None = None,
     ) -> tuple[dict, torch.Tensor | None]:
         """Generate a long video via temporal tiling.
 
-        All chunks are generated at half resolution (width//2, height//2) to fit
-        in 24GB VRAM — same as regular pipeline stage 1. The accumulated latent
-        is spatially upscaled once at the end.
+        When an upscale mode is used, chunks are generated at half resolution
+        (width//2, height//2) and then spatially upscaled once at the end before
+        the stage-2 refinement pass. This mirrors the regular two-stage pipeline.
 
         Args:
             progress_callback: (chunk_idx, total_chunks, frames_generated, total_frames, elapsed)
+            anchor_frames: Number of frames from chunk 0 to inject as identity
+                anchor via VideoConditionByKeyframeIndex in every subsequent
+                chunk. 0 disables anchoring. Default 1 (first frame only).
         """
         import gc
         from long_video_presets import calculate_chunks, nearest_valid_frames
-        from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES
 
         total_frames = nearest_valid_frames(total_frames)
         num_chunks, actual_total_frames = calculate_chunks(
             total_frames, temporal_tile_size, temporal_overlap,
         )
 
-        # Generate at full resolution — each chunk fits in 24GB with Stagehand
-        gen_w, gen_h = width, height
+        if upscale_mode == UpscaleMode.NONE:
+            gen_w, gen_h = width, height
+        else:
+            gen_w, gen_h = width // 2, height // 2
 
         logger.info(
             "Long video: %d frames (%d chunks), tile=%d, overlap=%d, "
@@ -594,9 +903,6 @@ class LTXVLongVideoService:
         )
 
         t_start = time.perf_counter()
-        sigmas = torch.tensor(
-            DISTILLED_SIGMA_VALUES, dtype=torch.float32, device=pipeline.device,
-        )
 
         # Parse per-step AdaIN factors
         psa_factors: list[float] = []
@@ -606,12 +912,60 @@ class LTXVLongVideoService:
         # Build ledger and encode text once (or per-chunk if per_chunk_prompts provided)
         # NOTE: pipeline.generate() has @torch.inference_mode() but long video
         # is called separately — must enable it here to avoid autograd OOM.
-        ledger = pipeline._build_ledger()
+        ledger, ledger_stage1, ledger_s2 = _build_long_video_ledgers(pipeline)
         cfg = pipeline.config
         nag_enabled = getattr(cfg, "nag_enabled", False)
+        neg_prompt, video_guider_params, audio_guider_params = _build_long_video_guidance(pipeline)
+        all_images = _collect_long_video_images(
+            cfg,
+            actual_total_frames=actual_total_frames,
+            image_path=image_path,
+            image_strength=image_strength,
+        )
+        chunk_conditionings: dict[int, list] = {}
+        chunk0_conditionings: list = []
+        stage2_conditionings: list = []
 
-        v_ctx, a_ctx, _, _, nag_v_ctx, nag_a_ctx = pipeline._encode_text_stagehand(
-            ledger, prompt, None, False,
+        if all_images:
+            from ltx_pipelines.utils.helpers import combined_image_conditionings
+
+            chunk_images = _distribute_images_to_chunks(
+                all_images,
+                total_frames=actual_total_frames,
+                temporal_tile_size=temporal_tile_size,
+                temporal_overlap=temporal_overlap,
+            )
+            video_encoder_for_cond = ledger.video_encoder()
+            for chunk_idx, chunk_images_for_idx in chunk_images.items():
+                chunk_conditionings[chunk_idx] = combined_image_conditionings(
+                    images=chunk_images_for_idx,
+                    height=gen_h,
+                    width=gen_w,
+                    video_encoder=video_encoder_for_cond,
+                    dtype=pipeline.dtype,
+                    device=pipeline.device,
+                )
+            chunk0_conditionings = chunk_conditionings.get(0, [])
+            if upscale_mode != UpscaleMode.NONE:
+                stage2_conditionings = combined_image_conditionings(
+                    images=all_images,
+                    height=height,
+                    width=width,
+                    video_encoder=video_encoder_for_cond,
+                    dtype=pipeline.dtype,
+                    device=pipeline.device,
+                )
+            del video_encoder_for_cond
+            gc.collect()
+            torch.cuda.empty_cache()
+            logger.info(
+                "Long video guide images enabled across %d chunk(s): %s",
+                len(chunk_conditionings),
+                [f"{img.path}@{img.frame_idx}" for img in all_images],
+            )
+
+        v_ctx, a_ctx, v_ctx_neg, a_ctx_neg, nag_v_ctx, nag_a_ctx = pipeline._encode_text_stagehand(
+            ledger, prompt, neg_prompt, False,
             lambda msg, frac: None,
             encode_nag=nag_enabled,
         )
@@ -621,13 +975,13 @@ class LTXVLongVideoService:
         if per_chunk_prompts:
             for ci, cp in enumerate(per_chunk_prompts):
                 if cp and cp != prompt:
-                    vc, ac, _, _ = pipeline._encode_text_stagehand(
+                    vc, ac, _, _, _, _ = pipeline._encode_text_stagehand(
                         ledger, cp, None, False, lambda msg, frac: None,
                     )
                     chunk_contexts[ci] = (vc, ac)
 
         # Load transformer (stays resident across all chunks)
-        transformer, xfm_inner, xfm_runtime = pipeline._setup_stagehand_transformer(ledger)
+        transformer, xfm_inner, xfm_runtime = pipeline._setup_stagehand_transformer(ledger_stage1)
 
         # Apply NAG if enabled in pipeline config
         nag_patch = None
@@ -639,14 +993,12 @@ class LTXVLongVideoService:
 
         try:
             # -- Chunk 0: Base generation at half-res --
-            from ltx_core.components.diffusion_steps import EulerDiffusionStep
             from ltx_core.components.noisers import GaussianNoiser
             from ltx_core.types import VideoPixelShape
             from ltx_pipelines.utils.types import PipelineComponents
 
             generator = torch.Generator(device=pipeline.device).manual_seed(seed)
             noiser = GaussianNoiser(generator=generator)
-            stepper = EulerDiffusionStep()
             components = PipelineComponents(dtype=pipeline.dtype, device=pipeline.device)
 
             # Ensure tile size satisfies 8n+1 constraint
@@ -656,12 +1008,19 @@ class LTXVLongVideoService:
             chunk0_shape = VideoPixelShape(
                 batch=1, frames=valid_tile, width=gen_w, height=gen_h, fps=fps,
             )
+            sigmas, stepper, use_res2s = _make_stage1_sampler(pipeline, chunk0_shape)
 
             video_state, audio_state = pipeline._stagehand_denoise(
                 transformer, xfm_runtime, v_ctx, a_ctx, chunk0_shape, sigmas,
-                noiser, stepper, components, [],
+                noiser, stepper, components, chunk0_conditionings,
                 lambda msg, frac: None,
                 label="Chunk 0", progress_base=0.0, progress_range=0.3,
+                v_ctx_neg=v_ctx_neg,
+                a_ctx_neg=a_ctx_neg,
+                video_guider_params=video_guider_params,
+                audio_guider_params=audio_guider_params,
+                use_res2s=use_res2s,
+                noise_seed=seed,
             )
 
             accumulated = {"samples": video_state.latent}
@@ -669,6 +1028,16 @@ class LTXVLongVideoService:
             chunk0_latent = {"samples": accumulated["samples"].clone()}
             accumulated_audio = audio_state.latent if audio_state.latent is not None else None
             del video_state, audio_state
+
+            # Extract anchor frames from chunk 0 for identity conditioning
+            anchor_latent = None
+            if anchor_frames > 0:
+                n_anchor = min(anchor_frames, chunk0_latent["samples"].shape[2])
+                anchor_latent = chunk0_latent["samples"][:, :, :n_anchor].clone()
+                logger.info(
+                    "Identity anchor: %d frame(s) from chunk 0, shape %s",
+                    n_anchor, tuple(anchor_latent.shape),
+                )
 
             if progress_callback:
                 elapsed = time.perf_counter() - t_start
@@ -679,30 +1048,16 @@ class LTXVLongVideoService:
                 # Per-chunk prompt override
                 vc, ac = chunk_contexts.get(chunk_idx, (v_ctx, a_ctx))
 
-                # Last chunk gets maximum overlap for more context
-                is_last_chunk = (chunk_idx == num_chunks - 1)
-                if is_last_chunk and num_chunks > 2:
-                    # Double the overlap, capped so we still generate >=8 new frames
-                    chunk_overlap = min(temporal_overlap * 2, temporal_tile_size - 8)
-                    # Ensure it satisfies 8-frame alignment
-                    chunk_overlap = (chunk_overlap // 8) * 8
-                    chunk_new = temporal_tile_size - chunk_overlap
-                    logger.info(
-                        "Last chunk %d: boosted overlap %d→%d (new_frames=%d)",
-                        chunk_idx, temporal_overlap, chunk_overlap, chunk_new,
-                    )
-                else:
-                    chunk_overlap = temporal_overlap
-                    chunk_new = temporal_tile_size - temporal_overlap
+                chunk_overlap = temporal_overlap
+                chunk_new = temporal_tile_size - temporal_overlap
 
-                accumulated, chunk_audio = extend_chunk(
+                accumulated, accumulated_audio = extend_chunk(
                     prev_latent=accumulated,
                     pipeline=pipeline,
                     transformer=transformer,
                     xfm_runtime=xfm_runtime,
                     v_ctx=vc,
                     a_ctx=ac,
-                    sigmas=sigmas,
                     overlap_frames=chunk_overlap,
                     num_new_frames=chunk_new,
                     adain_factor=adain_factor,
@@ -712,10 +1067,12 @@ class LTXVLongVideoService:
                     pixel_width=gen_w,
                     pixel_height=gen_h,
                     prev_audio=accumulated_audio,
-                )
-                # Accumulate audio — overlap frames already discarded by extend_chunk
-                accumulated_audio = extend_audio_latent(
-                    accumulated_audio, chunk_audio, overlap=0,
+                    anchor_latent=anchor_latent,
+                    extra_conditionings=chunk_conditionings.get(chunk_idx, []),
+                    v_ctx_neg=v_ctx_neg,
+                    a_ctx_neg=a_ctx_neg,
+                    video_guider_params=video_guider_params,
+                    audio_guider_params=audio_guider_params,
                 )
 
                 # Per-step AdaIN: apply chunk-level normalization against reference
@@ -769,16 +1126,18 @@ class LTXVLongVideoService:
             # that the initial 8-step generation cannot produce.
             # =========================================================
             accumulated = self._stage2_refine(
-                accumulated, pipeline, ledger, v_ctx, a_ctx,
+                accumulated, pipeline, ledger_s2, v_ctx, a_ctx,
                 nag_enabled, nag_v_ctx, nag_a_ctx,
-                width, height, fps,
+                gen_w, gen_h, fps,
+                seed=seed + 10_000,
+                conditionings=stage2_conditionings,
             )
 
         # Move audio to CPU
         if accumulated_audio is not None:
             accumulated_audio = accumulated_audio.cpu()
 
-        del ledger
+        del ledger, ledger_stage1, ledger_s2
         gc.collect()
         torch.cuda.empty_cache()
         return accumulated, accumulated_audio

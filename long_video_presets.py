@@ -9,7 +9,7 @@ PRESETS = {
         "temporal_tile_size": 97,
         "temporal_overlap": 32,
         "overlap_cond_strength": 0.5,
-        "adain_factor": 0.3,
+        "adain_factor": 0.0,
         "steps": 8,
         "upscale_mode": UpscaleMode.SPATIAL_PER_CHUNK,
         "notes": (
@@ -23,7 +23,7 @@ PRESETS = {
         "temporal_tile_size": 81,
         "temporal_overlap": 24,
         "overlap_cond_strength": 0.5,
-        "adain_factor": 0.3,
+        "adain_factor": 0.0,
         "steps": 8,
         "upscale_mode": UpscaleMode.SPATIAL_PER_CHUNK,
         "notes": (
@@ -37,7 +37,7 @@ PRESETS = {
         "temporal_tile_size": 57,
         "temporal_overlap": 16,
         "overlap_cond_strength": 0.4,
-        "adain_factor": 0.2,
+        "adain_factor": 0.0,
         "steps": 6,
         "upscale_mode": UpscaleMode.SPATIAL_PER_CHUNK,
         "notes": (

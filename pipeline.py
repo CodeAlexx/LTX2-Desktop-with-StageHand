@@ -26,8 +26,9 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn as nn
 
-from ltx_core.components.diffusion_steps import EulerDiffusionStep
+from ltx_core.components.diffusion_steps import EulerDiffusionStep, Res2sDiffusionStep
 from ltx_core.components.guiders import (
+    MultiModalGuider,
     MultiModalGuiderParams,
     create_multimodal_guider_factory,
 )
@@ -43,12 +44,15 @@ from ltx_pipelines.utils import (
     ModelLedger,
     denoise_audio_video,
     euler_denoising_loop,
+    multi_modal_guider_denoising_func,
     multi_modal_guider_factory_denoising_func,
+    res2s_audio_video_denoising_loop,
     simple_denoising_func,
 )
 from ltx_pipelines.utils.args import ImageConditioningInput
 from ltx_pipelines.utils.constants import (
     DISTILLED_SIGMA_VALUES,
+    LTX_2_3_HQ_PARAMS,
     STAGE_2_DISTILLED_SIGMA_VALUES,
 )
 
@@ -60,7 +64,7 @@ FOUR_PASS_STAGE4_SIGMAS = torch.tensor(
 from ltx_core.model.audio_vae import encode_audio as vae_encode_audio
 from ltx_core.types import Audio, AudioLatentShape
 from ltx_pipelines.utils.helpers import combined_image_conditionings
-from ltx_pipelines.utils.media_io import decode_audio_from_file
+from ltx_pipelines.utils.media_io import decode_audio_from_file, load_video_conditioning
 from ltx_pipelines.utils.media_io import encode_video
 from ltx_pipelines.utils.types import PipelineComponents
 
@@ -68,6 +72,8 @@ from ltx_core.quantization.policy import QuantizationPolicy
 from stagehand import StagehandConfig, StagehandRuntime
 
 from config import AppConfig
+from audio_utils import normalize_output_audio
+from hq_runtime_loader import attach_runtime_lora_merge, attach_runtime_scaled_fp8_dequantization
 from nag import NAGPatch
 
 if TYPE_CHECKING:
@@ -97,6 +103,22 @@ def _log_vram(msg: str) -> None:
 def rescale_sigmas(sigmas: torch.Tensor, factor: float) -> torch.Tensor:
     """Scale non-zero sigmas by factor."""
     return torch.where(sigmas != 0, sigmas * factor, sigmas)
+
+
+def _read_ic_lora_downscale(lora_paths: list[str]) -> int:
+    """Read reference_downscale_factor from IC-LoRA safetensors metadata."""
+    from safetensors import safe_open
+    factor = 1
+    for path in lora_paths:
+        try:
+            with safe_open(path, framework="pt") as f:
+                meta = f.metadata() or {}
+                scale = int(meta.get("reference_downscale_factor", 1))
+                if scale != 1:
+                    factor = scale
+        except Exception:
+            pass
+    return factor
 
 
 def _needs_spatial_tiling(h_pixels: int, w_pixels: int, tile_pixels: int) -> bool:
@@ -306,41 +328,77 @@ class LTX2Pipeline:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = torch.bfloat16
 
-    def _build_ledger(self, *, with_distilled_lora: bool = False) -> ModelLedger:
+    @staticmethod
+    def _detect_lora_sd_ops(path: str):
+        """Auto-detect LoRA key format and return appropriate SDOps.
+
+        Lightricks/ComfyUI LoRAs use ``diffusion_model.`` prefix.
+        Serenity LoRAs use ``transformer.`` prefix.
+        Returns SDOps that normalises either format so ltx_core can match keys.
+        """
+        from ltx_core.loader import SDOps
+        try:
+            from safetensors import safe_open
+            with safe_open(path, framework="pt", device="cpu") as f:
+                first_key = next(iter(f.keys()), "")
+            if first_key.startswith("transformer."):
+                return SDOps("serenity_lora").with_matching().with_replacement("transformer.", "")
+            if first_key.startswith("diffusion_model."):
+                return SDOps("comfyui_lora").with_matching().with_replacement("diffusion_model.", "")
+        except Exception:
+            pass
+        return None
+
+    def _build_ledger(self, *, with_distilled_lora: bool = False,
+                      distilled_lora_strength_override: float | None = None,
+                      checkpoint_override: str | tuple[str, ...] | None = None,
+                      skip_user_loras: bool = False,
+                      dequantize_scaled_fp8_to_bf16: bool = False) -> ModelLedger:
         """Build ModelLedger with LoRA support."""
+        ckpt_path = checkpoint_override or self.config.checkpoint_path
+        ckpt_desc = " | ".join(ckpt_path) if isinstance(ckpt_path, tuple) else ckpt_path
+
         loras = []
-        if self.config.lora_paths:
+        if self.config.lora_paths and not skip_user_loras:
             from ltx_core.loader import LoraPathStrengthAndSDOps
             for path, strength in zip(self.config.lora_paths, self.config.lora_strengths):
                 if path:
-                    loras.append(LoraPathStrengthAndSDOps(path=path, strength=strength, sd_ops=None))
+                    sd_ops = self._detect_lora_sd_ops(path)
+                    loras.append(LoraPathStrengthAndSDOps(path=path, strength=strength, sd_ops=sd_ops))
 
-        # For dev mode stage 2, add the distilled LoRA
+        # For dev mode stage 2, add the distilled LoRA directly via ltx-core apply_loras.
+        # HQ mode uses a transformer load-time merge instead to avoid the expensive full-model pass.
         if with_distilled_lora and self.config.distilled_lora_path:
             from ltx_core.loader import LoraPathStrengthAndSDOps
+            sd_ops = self._detect_lora_sd_ops(self.config.distilled_lora_path)
+            strength = distilled_lora_strength_override if distilled_lora_strength_override is not None else self.config.distilled_lora_strength
             loras.append(LoraPathStrengthAndSDOps(
                 path=self.config.distilled_lora_path,
-                strength=self.config.distilled_lora_strength,
-                sd_ops=None,
+                strength=strength,
+                sd_ops=sd_ops,
             ))
 
         # Auto-detect FP8 checkpoint → pass QuantizationPolicy so ModelLedger
         # wraps Linear layers with upcast-on-forward (fp8_cast policy).
         quantization = None
-        ckpt = self.config.checkpoint_path.lower()
-        if "fp8" in ckpt:
+        if dequantize_scaled_fp8_to_bf16:
+            logger.info("FP8 checkpoint detected — dequantizing scaled-FP8 transformer weights to BF16 at load time")
+        elif "fp8" in ckpt_desc.lower():
             quantization = QuantizationPolicy.fp8_cast()
             logger.info("FP8 checkpoint detected — using fp8_cast quantization policy")
 
-        return ModelLedger(
+        ledger = ModelLedger(
             dtype=self.dtype,
             device=self.device,
-            checkpoint_path=self.config.checkpoint_path,
+            checkpoint_path=ckpt_path,
             gemma_root_path=self.config.gemma_root,
             spatial_upsampler_path=self.config.spatial_upsampler_path,
             loras=tuple(loras) if loras else (),
             quantization=quantization,
         )
+        if dequantize_scaled_fp8_to_bf16:
+            attach_runtime_scaled_fp8_dequantization(ledger)
+        return ledger
 
     def _encode_text_stagehand(
         self,
@@ -518,15 +576,10 @@ class LTX2Pipeline:
         shape: VideoPixelShape,
         sigmas: torch.Tensor,
         noiser: GaussianNoiser,
-        stepper: EulerDiffusionStep,
+        stepper: EulerDiffusionStep | Res2sDiffusionStep,
         pipeline_components: PipelineComponents,
         conditionings: list,
         report: Callable[[str, float], None],
-        # NOTE (Phase 7, Task 0 — NestedTensor/DMA audit):
-        # Stagehand only manages transformer_blocks weight streaming (CPU↔GPU DMA).
-        # The AV latent (NestedTensor) flows through base_fn → denoise_audio_video()
-        # → transformer.forward() inside managed_forward(). Stagehand never touches
-        # the latent itself — it only ensures block weights are on-GPU before forward.
         label: str = "",
         progress_base: float = 0.0,
         progress_range: float = 0.3,
@@ -538,31 +591,57 @@ class LTX2Pipeline:
         a_ctx_neg: torch.Tensor | None = None,
         video_guider_params: MultiModalGuiderParams | None = None,
         audio_guider_params: MultiModalGuiderParams | None = None,
+        # HQ mode: use res2s sampler instead of Euler
+        use_res2s: bool = False,
+        noise_seed: int = -1,
     ) -> tuple[Any, Any]:
         """Run denoising with Stagehand-managed transformer.
 
-        If video_guider_params is provided, uses CFG/STG guidance (dev mode).
+        If video_guider_params is provided, uses CFG/STG guidance.
         Otherwise uses simple_denoising_func (distilled mode).
+        If use_res2s is True, uses res2s second-order sampler instead of Euler.
         """
         use_guidance = video_guider_params is not None
 
         if use_guidance:
-            video_guider_factory = create_multimodal_guider_factory(
-                params=video_guider_params,
-                negative_context=v_ctx_neg,
-            )
-            audio_guider_factory = create_multimodal_guider_factory(
-                params=audio_guider_params,
-                negative_context=a_ctx_neg,
-            ) if audio_guider_params is not None else None
+            if use_res2s:
+                # HQ mode: use MultiModalGuider directly (not factory)
+                video_guider = MultiModalGuider(
+                    params=video_guider_params,
+                    negative_context=v_ctx_neg,
+                )
+                audio_guider = MultiModalGuider(
+                    params=audio_guider_params,
+                    negative_context=a_ctx_neg,
+                ) if audio_guider_params is not None else MultiModalGuider(
+                    params=video_guider_params,
+                    negative_context=v_ctx_neg,
+                )
+                base_fn = multi_modal_guider_denoising_func(
+                    video_guider=video_guider,
+                    audio_guider=audio_guider,
+                    v_context=v_ctx,
+                    a_context=a_ctx,
+                    transformer=transformer,
+                )
+            else:
+                # Dev mode: use factory pattern (per-step sigma-based guiders)
+                video_guider_factory = create_multimodal_guider_factory(
+                    params=video_guider_params,
+                    negative_context=v_ctx_neg,
+                )
+                audio_guider_factory = create_multimodal_guider_factory(
+                    params=audio_guider_params,
+                    negative_context=a_ctx_neg,
+                ) if audio_guider_params is not None else None
 
-            base_fn = multi_modal_guider_factory_denoising_func(
-                video_guider_factory=video_guider_factory,
-                audio_guider_factory=audio_guider_factory,
-                v_context=v_ctx,
-                a_context=a_ctx,
-                transformer=transformer,
-            )
+                base_fn = multi_modal_guider_factory_denoising_func(
+                    video_guider_factory=video_guider_factory,
+                    audio_guider_factory=audio_guider_factory,
+                    v_context=v_ctx,
+                    a_context=a_ctx,
+                    transformer=transformer,
+                )
         else:
             base_fn = simple_denoising_func(
                 video_context=v_ctx,
@@ -570,27 +649,55 @@ class LTX2Pipeline:
                 transformer=transformer,
             )
 
-        _step = [0]
+        # res2s does 2 model evals per step (current + midpoint), so count
+        # model calls for progress, not denoising-loop iterations.
+        _call = [0]
         n_steps = len(sigmas) - 1
+        # res2s calls denoise_fn ~2× per step + final step
+        n_total_calls = (n_steps * 2 + 1) if use_res2s else n_steps
 
-        def wrapped_fn(video_state, audio_state, sigmas_arg, step_index):
-            xfm_runtime.begin_step(_step[0])
+        def wrapped_fn(video_state, audio_state, sigmas, step_index):
+            xfm_runtime.begin_step(_call[0])
             with xfm_runtime.managed_forward():
-                result = base_fn(video_state, audio_state, sigmas_arg, step_index)
+                result = base_fn(video_state, audio_state, sigmas, step_index)
             xfm_runtime.end_step()
-            _step[0] += 1
-            frac = progress_base + progress_range * (_step[0] / n_steps)
-            report(f"{label} step {_step[0]}/{n_steps}", frac)
+            _call[0] += 1
+            # Diagnostic: check first 5 calls for NaN/Inf and value ranges
+            if _call[0] <= 5:
+                dv, da = result
+                import torch as _t
+                sig_val = sigmas[step_index].item() if step_index < len(sigmas) else -1
+                logger.info(f"DIAG call {_call[0]} sigma={sig_val:.4f}: denoised nan={_t.isnan(dv).sum().item()}, "
+                            f"inf={_t.isinf(dv).sum().item()}, "
+                            f"mean={dv.float().mean():.4f}, std={dv.float().std():.4f}, "
+                            f"range=[{dv.float().min():.4f}, {dv.float().max():.4f}]")
+                logger.info(f"DIAG call {_call[0]}: input nan={_t.isnan(video_state.latent).sum().item()}, "
+                            f"mean={video_state.latent.float().mean():.4f}, std={video_state.latent.float().std():.4f}, "
+                            f"range=[{video_state.latent.float().min():.4f}, {video_state.latent.float().max():.4f}]")
+            frac = progress_base + progress_range * (_call[0] / n_total_calls)
+            report(f"{label} eval {_call[0]}/{n_total_calls}", frac)
             return result
 
-        def loop_fn(sigmas_arg, video_state, audio_state, stepper_arg):
-            return euler_denoising_loop(
-                sigmas=sigmas_arg,
-                video_state=video_state,
-                audio_state=audio_state,
-                stepper=stepper_arg,
-                denoise_fn=wrapped_fn,
-            )
+        if use_res2s:
+            _res2s_seed = noise_seed
+            def loop_fn(sigmas_arg, video_state, audio_state, stepper_arg):
+                return res2s_audio_video_denoising_loop(
+                    sigmas=sigmas_arg,
+                    video_state=video_state,
+                    audio_state=audio_state,
+                    stepper=stepper_arg,
+                    denoise_fn=wrapped_fn,
+                    noise_seed=_res2s_seed,
+                )
+        else:
+            def loop_fn(sigmas_arg, video_state, audio_state, stepper_arg):
+                return euler_denoising_loop(
+                    sigmas=sigmas_arg,
+                    video_state=video_state,
+                    audio_state=audio_state,
+                    stepper=stepper_arg,
+                    denoise_fn=wrapped_fn,
+                )
 
         kwargs = {}
         if noise_scale is not None:
@@ -640,9 +747,10 @@ class LTX2Pipeline:
         enhance_prompt: bool | None = None,
         image_path: str | None = None,
         image_strength: float | None = None,
-        image_crf: int = 35,
+        image_crf: int | None = None,
         audio_path: str | None = None,
         audio_start_time: float = 0.0,
+        audio_max_duration: float | None = None,
         negative_prompt: str | None = None,
         num_inference_steps: int | None = None,
         video_cfg_scale: float | None = None,
@@ -653,7 +761,13 @@ class LTX2Pipeline:
         audio_rescale: float | None = None,
         a2v_scale: float | None = None,
         v2a_scale: float | None = None,
+        video_skip_step: int | None = None,
+        audio_skip_step: int | None = None,
         stg_blocks: list[int] | None = None,
+        keyframes: list[ImageConditioningInput] | None = None,
+        ic_lora_video_path: str | None = None,
+        ic_lora_strength: float | None = None,
+        ic_lora_attention_strength: float | None = None,
         progress_cb: Callable[[str, float], None] | None = None,
         **_kwargs: Any,
     ) -> Path:
@@ -673,7 +787,9 @@ class LTX2Pipeline:
         do_enhance = enhance_prompt if enhance_prompt is not None else cfg.enhance_prompt
         img_path = image_path or cfg.image_path
         img_strength = image_strength if image_strength is not None else cfg.image_strength
-        neg_prompt = negative_prompt if negative_prompt is not None else (cfg.negative_prompt if not is_distilled else None)
+        img_crf = image_crf if image_crf is not None else cfg.image_crf
+        audio_limit = audio_max_duration if audio_max_duration is not None else cfg.audio_max_duration
+        neg_prompt = negative_prompt if negative_prompt is not None else (cfg.negative_prompt if (not is_distilled or cfg.hq_sampler_enabled) else None)
         n_steps = num_inference_steps or cfg.num_inference_steps
 
         # Guidance params (dev mode only)
@@ -685,6 +801,8 @@ class LTX2Pipeline:
         a_rsc = audio_rescale if audio_rescale is not None else cfg.audio_rescale
         a2v = a2v_scale if a2v_scale is not None else cfg.a2v_scale
         v2a = v2a_scale if v2a_scale is not None else cfg.v2a_scale
+        video_skip = video_skip_step if video_skip_step is not None else cfg.video_skip_step
+        audio_skip = audio_skip_step if audio_skip_step is not None else cfg.audio_skip_step
         stg_blks = stg_blocks if stg_blocks is not None else cfg.stg_blocks
 
         t_total = time.perf_counter()
@@ -694,18 +812,66 @@ class LTX2Pipeline:
                 progress_cb(phase, frac)
 
         report("Initializing...", 0.0)
-        mode_str = "distilled" if is_distilled else f"dev({n_steps}steps, cfg={v_cfg})"
+        mode_str = (
+            f"hq({cfg.hq_num_inference_steps}steps, cfg={v_cfg})"
+            if cfg.hq_sampler_enabled
+            else ("distilled" if is_distilled else f"dev({n_steps}steps, cfg={v_cfg})")
+        )
         _log_vram(f"Starting generation: {w}x{h}, {nf}f, seed={s}, mode={mode_str}, enhance={do_enhance}, i2v={bool(img_path)}")
 
         # Build ModelLedger (loads nothing until .transformer() etc. called)
-        ledger = self._build_ledger()
+        use_hq = cfg.hq_sampler_enabled
 
-        # For dev mode stage 2, we need a separate ledger with distilled LoRA
-        ledger_s2 = self._build_ledger(with_distilled_lora=True) if not is_distilled else ledger
+        if use_hq:
+            # HQ mode follows the official two-stage path: the full dev checkpoint is used
+            # for all components, with the distilled LoRA applied at runtime at different
+            # strengths for stage 1 and stage 2.
+            hq_dev_checkpoint = cfg.resolve_hq_dev_checkpoint_path()
+            hq_s1_checkpoint, hq_s2_checkpoint = cfg.resolve_hq_transformer_checkpoint_paths()
+            logger.info("HQ mode using dev checkpoint: %s", hq_dev_checkpoint)
+            ledger = self._build_ledger(checkpoint_override=hq_dev_checkpoint, skip_user_loras=True)
+            if hq_s1_checkpoint and hq_s2_checkpoint:
+                logger.info(
+                    "HQ mode using premerged BF16 transformer checkpoints: %s | %s",
+                    hq_s1_checkpoint,
+                    hq_s2_checkpoint,
+                )
+                ledger_hq_s1 = self._build_ledger(
+                    checkpoint_override=hq_s1_checkpoint,
+                    skip_user_loras=True,
+                )
+                ledger_s2 = self._build_ledger(
+                    checkpoint_override=hq_s2_checkpoint,
+                    skip_user_loras=True,
+                )
+            else:
+                ledger_hq_s1 = self._build_ledger(
+                    checkpoint_override=hq_dev_checkpoint,
+                    skip_user_loras=True,
+                )
+                attach_runtime_lora_merge(
+                    ledger_hq_s1,
+                    lora_path=cfg.distilled_lora_path,
+                    strength=cfg.hq_distilled_lora_strength_s1,
+                )
+                ledger_s2 = self._build_ledger(
+                    checkpoint_override=hq_dev_checkpoint,
+                    skip_user_loras=True,
+                )
+                attach_runtime_lora_merge(
+                    ledger_s2,
+                    lora_path=cfg.distilled_lora_path,
+                    strength=cfg.hq_distilled_lora_strength_s2,
+                )
+        else:
+            ledger = self._build_ledger()
+            ledger_hq_s1 = None
+            # For dev mode stage 2, we need a separate ledger with distilled LoRA
+            ledger_s2 = self._build_ledger(with_distilled_lora=True) if not is_distilled else ledger
 
         # Build image conditionings for I2V
         # Feature #6: preprocess_input_image controls CRF compression (0 = bypass)
-        effective_crf = image_crf if cfg.preprocess_input_image else 0
+        effective_crf = img_crf if cfg.preprocess_input_image else 0
         images: list[ImageConditioningInput] = []
         if img_path:
             images.append(ImageConditioningInput(
@@ -714,13 +880,22 @@ class LTX2Pipeline:
                 strength=img_strength,
                 crf=effective_crf,
             ))
+        # Append additional keyframe conditionings (FML2V)
+        if keyframes:
+            images.extend(keyframes)
+
+        # IC-LoRA video conditioning
+        ic_video = ic_lora_video_path or cfg.ic_lora_video_path or None
+        ic_strength = ic_lora_strength if ic_lora_strength is not None else cfg.ic_lora_strength
+        ic_attn = ic_lora_attention_strength if ic_lora_attention_strength is not None else cfg.ic_lora_attention_strength
 
         # =====================================================================
         # Text encoding (Gemma 3 12B via Stagehand)
         # =====================================================================
         # Feature #5: Zero negative conditioning for I2V skips negative encoding
         skip_neg_encode = cfg.zero_negative_conditioning and bool(img_path)
-        encode_neg = None if (is_distilled or skip_neg_encode) else neg_prompt
+        needs_neg = not is_distilled or use_hq  # HQ mode needs negative prompt for CFG
+        encode_neg = None if (not needs_neg or skip_neg_encode) else neg_prompt
 
         v_ctx, a_ctx, v_ctx_neg, a_ctx_neg, nag_v_ctx, nag_a_ctx = self._encode_text_stagehand(
             ledger, prompt, encode_neg, do_enhance, report,
@@ -728,7 +903,7 @@ class LTX2Pipeline:
         )
 
         # Feature #5: Replace negative with zeros if I2V + zero_negative_conditioning
-        if skip_neg_encode and not is_distilled:
+        if skip_neg_encode and needs_neg:
             v_ctx_neg = torch.zeros_like(v_ctx)
             a_ctx_neg = torch.zeros_like(a_ctx) if a_ctx is not None else None
 
@@ -742,7 +917,7 @@ class LTX2Pipeline:
             decoded_audio = decode_audio_from_file(
                 a2v_audio_path, self.device,
                 start_time=audio_start_time,
-                max_duration=nf / fr if nf and fr else None,
+                max_duration=audio_limit if audio_limit is not None else (nf / fr if nf and fr else None),
             )
             if decoded_audio is not None:
                 audio_encoder = ledger.audio_encoder()
@@ -769,22 +944,42 @@ class LTX2Pipeline:
                 logger.warning("No audio stream found in %s", a2v_audio_path)
 
         # Common components
+        use_hq = cfg.hq_sampler_enabled
         generator = torch.Generator(device=self.device).manual_seed(s)
         noiser = GaussianNoiser(generator=generator)
-        stepper = EulerDiffusionStep()
+        stepper = Res2sDiffusionStep() if use_hq else EulerDiffusionStep()
         pipeline_components = PipelineComponents(dtype=self.dtype, device=self.device)
 
-        # Build guidance params for dev mode
+        # Build guidance params for dev mode or HQ mode
         video_guider_params = None
         audio_guider_params = None
-        if not is_distilled:
+        if use_hq:
+            hq_video = LTX_2_3_HQ_PARAMS.video_guider_params
+            hq_audio = LTX_2_3_HQ_PARAMS.audio_guider_params
+            video_guider_params = MultiModalGuiderParams(
+                cfg_scale=hq_video.cfg_scale,
+                stg_scale=hq_video.stg_scale,
+                rescale_scale=hq_video.rescale_scale,
+                modality_scale=hq_video.modality_scale,
+                skip_step=hq_video.skip_step,
+                stg_blocks=list(hq_video.stg_blocks),
+            )
+            audio_guider_params = MultiModalGuiderParams(
+                cfg_scale=hq_audio.cfg_scale,
+                stg_scale=hq_audio.stg_scale,
+                rescale_scale=hq_audio.rescale_scale,
+                modality_scale=hq_audio.modality_scale,
+                skip_step=hq_audio.skip_step,
+                stg_blocks=list(hq_audio.stg_blocks),
+            )
+        elif not is_distilled:
             video_guider_params = MultiModalGuiderParams(
                 cfg_scale=v_cfg, stg_scale=v_stg, rescale_scale=v_rsc,
-                modality_scale=a2v, skip_step=0, stg_blocks=stg_blks,
+                modality_scale=a2v, skip_step=max(0, int(video_skip)), stg_blocks=stg_blks,
             )
             audio_guider_params = MultiModalGuiderParams(
                 cfg_scale=a_cfg, stg_scale=a_stg, rescale_scale=a_rsc,
-                modality_scale=v2a, skip_step=0, stg_blocks=stg_blks,
+                modality_scale=v2a, skip_step=max(0, int(audio_skip)), stg_blocks=stg_blks,
             )
 
         if cfg.use_four_pass:
@@ -802,8 +997,9 @@ class LTX2Pipeline:
             )
         else:
             video_latent, audio_latent, fr = self._generate_two_stage(
-                cfg=cfg, is_distilled=is_distilled, w=w, h=h, nf=nf, fr=fr, n_steps=n_steps,
-                ledger=ledger, ledger_s2=ledger_s2,
+                cfg=cfg, is_distilled=is_distilled, w=w, h=h, nf=nf, fr=fr, n_steps=n_steps, seed=s,
+                ledger=ledger_hq_s1 or ledger, ledger_s2=ledger_s2,
+                vae_ledger=ledger if ledger_hq_s1 else None,
                 v_ctx=v_ctx, a_ctx=a_ctx, v_ctx_neg=v_ctx_neg, a_ctx_neg=a_ctx_neg,
                 nag_v_ctx=nag_v_ctx, nag_a_ctx=nag_a_ctx,
                 noiser=noiser, stepper=stepper, pipeline_components=pipeline_components,
@@ -812,6 +1008,9 @@ class LTX2Pipeline:
                 video_guider_params=video_guider_params,
                 audio_guider_params=audio_guider_params,
                 report=report,
+                ic_lora_video_path=ic_video,
+                ic_lora_strength=ic_strength,
+                ic_lora_attention_strength=ic_attn,
             )
 
         del v_ctx, a_ctx, v_ctx_neg, a_ctx_neg, nag_v_ctx, nag_a_ctx
@@ -855,6 +1054,7 @@ class LTX2Pipeline:
                 ledger.audio_decoder(),
                 ledger.vocoder(),
             )
+            decoded_audio = normalize_output_audio(decoded_audio)
         _log_vram(f"vae_decode_done ({time.perf_counter() - t0:.1f}s)")
 
         # Save output
@@ -862,7 +1062,9 @@ class LTX2Pipeline:
         out_dir = cfg.ensure_output_dir()
         import datetime
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        mode_tag = "distilled" if is_distilled else "dev"
+        mode_tag = "hq" if cfg.hq_sampler_enabled else ("distilled" if is_distilled else "dev")
+        if ic_video:
+            mode_tag += "_iclora"
         four_pass_tag = "_4pass" if cfg.use_four_pass else ""
         out_path = out_dir / f"ltx2_{mode_tag}{four_pass_tag}_{ts}_s{s}.mp4"
 
@@ -887,16 +1089,24 @@ class LTX2Pipeline:
         return out_path
 
     def _generate_two_stage(
-        self, *, cfg, is_distilled, w, h, nf, fr, n_steps,
+        self, *, cfg, is_distilled, w, h, nf, fr, n_steps, seed,
         ledger, ledger_s2, v_ctx, a_ctx, v_ctx_neg, a_ctx_neg,
         nag_v_ctx, nag_a_ctx, noiser, stepper, pipeline_components,
         generator, images, initial_audio_latent,
         video_guider_params, audio_guider_params, report,
+        vae_ledger=None,
+        ic_lora_video_path: str | None = None,
+        ic_lora_strength: float = 1.0,
+        ic_lora_attention_strength: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor | None, float]:
         """Standard two-stage pipeline: half-res → spatial upscale + refine.
 
         Returns (video_latent, audio_latent, fps).
         """
+        # For HQ mode, vae_ledger points to the distilled ledger (matching VAE/connector dims)
+        # while ledger points to the HQ-merged checkpoint (for transformer only)
+        _vae_ledger = vae_ledger or ledger
+
         # =================================================================
         # Stage 1: Half-res denoise
         # =================================================================
@@ -906,7 +1116,15 @@ class LTX2Pipeline:
         s1_w, s1_h = w // 2, h // 2
         s1_shape = VideoPixelShape(batch=1, frames=nf, width=s1_w, height=s1_h, fps=fr)
 
-        if is_distilled:
+        use_hq = cfg.hq_sampler_enabled
+
+        if use_hq:
+            # HQ mode: use LTX2Scheduler with latent-aware sigma shifting (matches official HQ pipeline)
+            from ltx_core.types import VideoLatentShape
+            hq_steps = cfg.hq_num_inference_steps
+            empty_latent = torch.empty(VideoLatentShape.from_pixel_shape(s1_shape).to_torch_shape())
+            s1_sigmas = LTX2Scheduler().execute(latent=empty_latent, steps=hq_steps).to(dtype=torch.float32, device=self.device)
+        elif is_distilled:
             s1_sigmas = torch.tensor(DISTILLED_SIGMA_VALUES, dtype=torch.float32, device=self.device)
         else:
             if cfg.scheduler_type == "bong_tangent":
@@ -914,16 +1132,55 @@ class LTX2Pipeline:
             else:
                 s1_sigmas = LTX2Scheduler().execute(steps=n_steps).to(dtype=torch.float32, device=self.device)
 
-        # Load video encoder for image conditioning (needed before transformer)
+        # Load video encoder for image/video conditioning (needed before transformer)
         s1_conditionings: list = []
+        need_encoder = bool(images) or bool(ic_lora_video_path)
+        if need_encoder:
+            video_encoder_for_cond = _vae_ledger.video_encoder()
+
         if images:
             report("Stage 1: Encoding conditioning image...", 0.11)
-            video_encoder_for_cond = ledger.video_encoder()
             s1_conditionings = combined_image_conditionings(
                 images=images, height=s1_h, width=s1_w,
                 video_encoder=video_encoder_for_cond,
                 dtype=self.dtype, device=self.device,
             )
+
+        # IC-LoRA: encode reference video and create conditioning
+        ic_lora_ref_downscale = 1
+        if ic_lora_video_path:
+            report("Stage 1: Encoding IC-LoRA reference video...", 0.11)
+            from ltx_core.conditioning import (
+                ConditioningItemAttentionStrengthWrapper,
+                VideoConditionByReferenceLatent,
+            )
+            from ltx_core.types import VideoLatentShape
+            # Read downscale factor from LoRA metadata (if any)
+            ic_lora_ref_downscale = _read_ic_lora_downscale(cfg.lora_paths)
+            scale = ic_lora_ref_downscale
+            ref_h = s1_h // scale
+            ref_w = s1_w // scale
+            ref_video = load_video_conditioning(
+                video_path=ic_lora_video_path,
+                height=ref_h, width=ref_w,
+                frame_cap=nf,
+                dtype=self.dtype, device=self.device,
+            )
+            encoded_ref = video_encoder_for_cond(ref_video)
+            cond = VideoConditionByReferenceLatent(
+                latent=encoded_ref,
+                downscale_factor=scale,
+                strength=ic_lora_strength,
+            )
+            if ic_lora_attention_strength < 1.0:
+                cond = ConditioningItemAttentionStrengthWrapper(
+                    cond, attention_mask=ic_lora_attention_strength,
+                )
+            s1_conditionings.append(cond)
+            del ref_video, encoded_ref
+            _log_vram(f"IC-LoRA reference encoded (scale={scale}, strength={ic_lora_strength})")
+
+        if need_encoder:
             del video_encoder_for_cond
             _flush()
 
@@ -943,6 +1200,7 @@ class LTX2Pipeline:
             v_ctx_neg=v_ctx_neg, a_ctx_neg=a_ctx_neg,
             video_guider_params=video_guider_params,
             audio_guider_params=audio_guider_params,
+            use_res2s=use_hq, noise_seed=seed,
         )
         _log_vram(f"stage1_done ({time.perf_counter() - t0:.1f}s)")
 
@@ -968,8 +1226,8 @@ class LTX2Pipeline:
         report("Stage 2: Upsampling...", 0.45)
         t0 = time.perf_counter()
 
-        video_encoder = ledger.video_encoder()
-        upsampler = ledger.spatial_upsampler()
+        video_encoder = _vae_ledger.video_encoder()
+        upsampler = _vae_ledger.spatial_upsampler()
         upscaled = upsample_video(
             latent=s1_video_latent.to(self.device)[:1],
             video_encoder=video_encoder, upsampler=upsampler,
@@ -1045,6 +1303,7 @@ class LTX2Pipeline:
                 noise_scale=s2_sigmas[0].item(),
                 initial_video_latent=upscaled,
                 initial_audio_latent=s1_audio_latent.to(self.device) if s1_audio_latent is not None else None,
+                use_res2s=use_hq, noise_seed=seed + 1,
             )
         _log_vram(f"stage2_done ({time.perf_counter() - t0:.1f}s)")
 

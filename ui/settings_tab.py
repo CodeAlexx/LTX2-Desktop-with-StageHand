@@ -5,6 +5,7 @@ from __future__ import annotations
 import dearpygui.dearpygui as dpg
 
 from config import AppConfig
+from ui.theme import THEME_NAMES
 
 
 class SettingsTab:
@@ -22,6 +23,8 @@ class SettingsTab:
         self._output_dir_tag = None
         self._mode_tag = None
         self._distilled_lora_strength_tag = None
+        self._theme_tag = None
+        self._ui_scale_tag = None
         self._nag_enabled_tag = None
         self._nag_scale_tag = None
         self._nag_alpha_tag = None
@@ -30,6 +33,7 @@ class SettingsTab:
         self._spatial_tile_enabled_tag = None
         self._spatial_tile_pixels_tag = None
         self._spatial_tile_overlap_tag = None
+        self._status_tag = None
 
     def build(self, parent: int | str) -> None:
         with dpg.tab(label="Settings", parent=parent):
@@ -104,6 +108,28 @@ class SettingsTab:
                 dpg.add_button(label="Browse", callback=lambda: self._browse_dir(self._output_dir_tag))
 
             dpg.add_separator()
+            dpg.add_text("Display")
+            with dpg.group(horizontal=True):
+                dpg.add_text("Theme")
+                self._theme_tag = dpg.add_combo(
+                    items=THEME_NAMES,
+                    default_value=self.config.theme_name,
+                    width=180,
+                )
+                dpg.add_text("  UI Scale")
+                self._ui_scale_tag = dpg.add_input_float(
+                    default_value=self.config.ui_scale,
+                    width=100,
+                    step=0,
+                    min_value=0.0,
+                    max_value=3.0,
+                    min_clamped=True,
+                    max_clamped=True,
+                )
+            with dpg.group(horizontal=True):
+                dpg.add_text("0 = auto-detect from display. Theme applies immediately; scale is best after restart.", color=(180, 180, 180))
+
+            dpg.add_separator()
             dpg.add_text("NAG — Normalized Attention Guidance")
             dpg.add_text("  Used in all community workflows. Improves coherence.", color=(180, 180, 180))
             self._nag_enabled_tag = dpg.add_checkbox(
@@ -152,7 +178,15 @@ class SettingsTab:
                 )
 
             dpg.add_separator()
-            dpg.add_button(label="Save Settings", callback=self._save)
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Save Settings", callback=self._save)
+                dpg.add_button(label="Restore V1 Baseline", callback=self._restore_v1_baseline)
+            dpg.add_text(
+                "Restore V1 Baseline resets the app to the original clean distilled setup: model audio on, no default LoRA, no NAG. Restart after using it to refresh all tabs.",
+                color=(180, 180, 180),
+                wrap=840,
+            )
+            self._status_tag = dpg.add_text("", color=(180, 220, 255))
 
     def _browse_file(self, target_tag: int) -> None:
         def _selected(sender, app_data):
@@ -186,6 +220,8 @@ class SettingsTab:
         self.config.spatial_upsampler_path = dpg.get_value(self._upsampler_tag)
         self.config.temporal_upscaler_path = dpg.get_value(self._temporal_upsampler_tag)
         self.config.output_dir = dpg.get_value(self._output_dir_tag)
+        self.config.theme_name = dpg.get_value(self._theme_tag)
+        self.config.ui_scale = dpg.get_value(self._ui_scale_tag)
         self.config.nag_enabled = dpg.get_value(self._nag_enabled_tag)
         self.config.nag_scale = dpg.get_value(self._nag_scale_tag)
         self.config.nag_alpha = dpg.get_value(self._nag_alpha_tag)
@@ -194,6 +230,40 @@ class SettingsTab:
         self.config.spatial_tile_enabled = dpg.get_value(self._spatial_tile_enabled_tag)
         self.config.spatial_tile_pixels = max(32, dpg.get_value(self._spatial_tile_pixels_tag))
         self.config.spatial_tile_overlap = max(0, dpg.get_value(self._spatial_tile_overlap_tag))
+        self.config.save()
+        self._set_status("Settings saved.")
         if self._on_change:
             self._on_change()
+
+    def _restore_v1_baseline(self) -> None:
+        self.config.restore_v1_baseline()
+        self._sync_widgets_from_config()
         self.config.save()
+        self._set_status("V1 baseline restored and saved.")
+        if self._on_change:
+            self._on_change()
+
+    def _sync_widgets_from_config(self) -> None:
+        dpg.set_value(self._mode_tag, self.config.pipeline_mode)
+        dpg.set_value(self._distilled_ckpt_tag, self.config.distilled_checkpoint_path)
+        dpg.set_value(self._dev_ckpt_tag, self.config.dev_checkpoint_path)
+        dpg.set_value(self._distilled_lora_tag, self.config.distilled_lora_path)
+        dpg.set_value(self._distilled_lora_strength_tag, self.config.distilled_lora_strength)
+        dpg.set_value(self._gemma_tag, self.config.gemma_root)
+        dpg.set_value(self._upsampler_tag, self.config.spatial_upsampler_path)
+        dpg.set_value(self._temporal_upsampler_tag, self.config.temporal_upscaler_path)
+        dpg.set_value(self._output_dir_tag, self.config.output_dir)
+        dpg.set_value(self._theme_tag, self.config.theme_name)
+        dpg.set_value(self._ui_scale_tag, self.config.ui_scale)
+        dpg.set_value(self._nag_enabled_tag, self.config.nag_enabled)
+        dpg.set_value(self._nag_scale_tag, self.config.nag_scale)
+        dpg.set_value(self._nag_alpha_tag, self.config.nag_alpha)
+        dpg.set_value(self._nag_tau_tag, self.config.nag_tau)
+        dpg.set_value(self._ffn_chunks_tag, self.config.ffn_chunks)
+        dpg.set_value(self._spatial_tile_enabled_tag, self.config.spatial_tile_enabled)
+        dpg.set_value(self._spatial_tile_pixels_tag, self.config.spatial_tile_pixels)
+        dpg.set_value(self._spatial_tile_overlap_tag, self.config.spatial_tile_overlap)
+
+    def _set_status(self, message: str) -> None:
+        if self._status_tag is not None:
+            dpg.set_value(self._status_tag, message)
