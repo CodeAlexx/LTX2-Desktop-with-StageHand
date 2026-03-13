@@ -5,3 +5,4 @@ Pillow
 av
 sounddevice
 numpy
+stagehand @ git+https://github.com/CodeAlexx/StageHand.git

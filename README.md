@@ -47,6 +47,8 @@ Standalone desktop application for LTX-2.3 22B video generation on a **single 24
 pip install -r requirements.txt
 ```
 
+> **Note:** StageHand is installed from GitHub automatically via `requirements.txt`. Do **not** run `pip install stagehand` — that installs an unrelated PyPI package with the same name.
+
 Ensure `ltx-core/src` and `ltx-pipelines/src` are on your Python path. Either place the `LTX-2/packages` directory inside the app folder, or set `LTX_PACKAGES` to its location:
 
 ```bash
