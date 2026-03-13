@@ -4,6 +4,12 @@ Standalone desktop application for LTX-2.3 22B video generation on a **single 24
 
 ![Screenshot](screenshot.png)
 
+## Current Status
+
+- **Use Version 1 defaults for all settings.** Recent changes broke some advanced features and only the v1 defaults are working right now.
+- **LoRA is untested** — the UI supports loading LoRAs but this has not been validated. No guarantees.
+- **Gemma 3 12B** — The full (unquantized) Gemma 3 12B model is required. Quantized variants (INT8, QAT, GGUF) from other projects are not compatible with how ltx_core loads the text encoder. StageHand streams Gemma3 layers through VRAM one at a time (~512MB per layer), so the VRAM cost is low — the main cost is system RAM during loading.
+
 ## Key Points
 
 - **Runs on 24GB VRAM** — Tested on RTX 3090 Ti. The official LTX-2.3 22B pipeline requires 32GB+. StageHand block-swapping brings it down to 24GB by streaming transformer blocks through a pinned memory pool.
